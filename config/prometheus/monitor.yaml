@@ -12,12 +12,12 @@ metadata:
     app.kubernetes.io/part-of: lightspeed-operator
     app.kubernetes.io/managed-by: kustomize
   name: controller-manager-metrics-monitor
-  namespace: system
+  namespace: openshift-lightspeed
 spec:
   endpoints:
     - path: /metrics
-      port: https
-      scheme: https
+      port: "8080"
+      scheme: http
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
         insecureSkipVerify: true

@@ -88,6 +88,14 @@ rules:
   - get
   - update
 - apiGroups:
+  - image.openshift.io
+  resources:
+  - imagestreamtags
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - monitoring.coreos.com
   resources:
   - prometheusrules

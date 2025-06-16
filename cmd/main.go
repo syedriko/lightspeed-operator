@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"slices"
 	"time"
@@ -53,6 +54,8 @@ import (
 
 	"github.com/openshift/lightspeed-operator/internal/controller"
 	utiltls "github.com/openshift/lightspeed-operator/internal/tls"
+
+	imagev1 "github.com/openshift/api/image/v1"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -75,6 +78,8 @@ func init() {
 	utilruntime.Must(configv1.AddToScheme(scheme))
 
 	utilruntime.Must(olsv1alpha1.AddToScheme(scheme))
+
+	utilruntime.Must(imagev1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
@@ -260,6 +265,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "OLSConfig")
 		os.Exit(1)
 	}
+
+	if err := (&controller.ImageStreamTagReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Fatalf("unable to create controller: %v", err)
+	}
+
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

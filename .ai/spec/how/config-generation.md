@@ -7,7 +7,7 @@
 | `internal/controller/appserver/assets.go` | `GenerateOLSConfigMap()`, `buildProviderConfigs()`, `buildOLSConfig()`, `generateMCPServerConfigs()`, `buildToolFilteringConfig()` | OLS config YAML (olsconfig.yaml) |
 | `internal/controller/postgres/assets.go` | `GeneratePostgresConfigMap()`, `GeneratePostgresBootstrapSecret()`, `GeneratePostgresSecret()` | PostgreSQL config + bootstrap script + credentials |
 | `internal/controller/console/assets.go` | `GenerateConsoleUIConfigMap()` | Nginx config for console plugin |
-| `internal/controller/ocpmcp/assets.go` | `GenerateConfigMap()` | MCP server denied-resources config (TOML) |
+| `internal/controller/ocpmcp/assets.go` | `GenerateConfigMap()` | Standalone MCP runtime config (TOML): TLS, toolsets, denied resources, metrics |
 
 ## Data Flow
 
@@ -120,13 +120,13 @@ mcp_servers:                                         # if any MCP servers config
     url: https://openshift-mcp-server.<ns>.svc:8443/mcp
     timeout: <mcpKubeServerConfig.timeout or default 60>
     headers:
-      x-kube-auth: "{{KUBERNETES_TOKEN}}"
+      Authorization: kubernetes                     # service resolves caller credentials
   - name: <user server>                              # if MCPServer feature gate
     url: <url>
     timeout: <timeout>
     headers:
-      <name>: <resolved value>                       # kubernetes -> "{{KUBERNETES_TOKEN}}"
-                                                     # client -> "{{CLIENT_TOKEN}}"
+      <name>: <resolved value>                       # kubernetes -> "kubernetes"
+                                                     # client -> "client"
                                                      # secret -> /etc/mcp/headers/<secretName>/header
 
 user_data_collector_config:                          # if dataCollectorEnabled
@@ -174,8 +174,15 @@ Inline in `GenerateConsoleUIConfigMap()`:
 - TLS cert/key from `/var/cert/tls.crt` and `/var/cert/tls.key`
 
 ### MCP Server Config (TOML)
-Inline in `ocpmcp` package `configTOML` constant:
+`ocpmcp.GenerateConfigMap()` writes the static `configTOML` constant to `openshift-mcp-server-config`, key `config.toml`. The standalone Deployment mounts it read-only with `subPath` at `/etc/mcp-server/config.toml` and starts `/openshift-mcp-server --config /etc/mcp-server/config.toml`.
 ```toml
+port = "8443"
+tls_cert = "/etc/tls/tls.crt"
+tls_key = "/etc/tls/tls.key"
+read_only = false
+toolsets = ["core", "config", "helm", "observability/metrics", "kubevirt"]
+experimental_enable_target_compatibility_tool_filters = true
+
 [[denied_resources]]
 group = ""
 version = "v1"
@@ -184,7 +191,16 @@ kind = "Secret"
 [[denied_resources]]
 group = "rbac.authorization.k8s.io"
 version = "v1"
+
+[toolset_configs."observability/metrics"]
+prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+alertmanager_url = "https://alertmanager-main.openshift-monitoring.svc.cluster.local:9094"
+guardrails = "!tsdb"
 ```
+
+The RBAC entry omits `kind`, denying the entire v1 API group. `read_only = false` permits write tools without granting caller permissions; `!tsdb` controls PromQL query safety, not authorization. There is currently no CR field for changing toolsets or their runtime configuration. `spec.ols.mcpKubeServerConfig.timeout` affects only the app-server client. ConfigMap ResourceVersion changes roll the standalone MCP Deployment, not the app-server; see [deployment-generation.md](deployment-generation.md) and [ocpmcp.md](../what/ocpmcp.md).
+
+Header values `kubernetes` and `client` are service-interpreted placeholders, not credentials or token-template strings. The built-in endpoint uses `Authorization: kubernetes`.
 
 ## Key Abstractions
 
@@ -220,7 +236,9 @@ PostgreSQL schemas isolate data from different components within the same databa
 | `solr_hybrid` | Operator defaults + `!byokRAGOnly` | OCP product docs via OKP Solr at `https://lightspeed-rhokp.<ns>.svc:8443` (standalone RHOKP Deployment) |
 | RHOKP image | `--rhokp-image` flag | Standalone RHOKP Deployment image; default from `related_images.json` (`rhokp`); listed in bundle `relatedImages` |
 | ROSA product | Console brand + Infrastructure topology (detected at operator startup) | `OLS_ROSA_PRODUCT` env var on app-server when brand is `ROSA` (not in config YAML). `External` → HCP product; otherwise Classic. Omitted on detection failure or non-ROSA. |
-| MCP servers | CR `spec.mcpServers[]` + `spec.ols.introspectionEnabled` | Feature gated by `MCPServer` gate |
+| Built-in MCP client | CR `spec.ols.introspectionEnabled` + `spec.ols.mcpKubeServerConfig.timeout` | Enabled by introspection (absent means true); no `MCPServer` gate required |
+| External MCP clients | CR `spec.mcpServers[]` | Require `MCPServer` gate |
+| Built-in MCP runtime | `ocpmcp.configTOML` constant | Operator-owned defaults; mounted only by standalone MCP |
 | Tool filtering | CR `spec.ols.toolFilteringConfig` | Feature gated by `ToolFiltering` gate; requires MCP servers |
 | Proxy config | CR `spec.ols.proxyConfig` | Proxy URL + optional CA cert configmap |
 | Query filters | CR `spec.ols.queryFilters[]` | Regex patterns for content filtering |

@@ -8,8 +8,8 @@ The App Server is the backend deployment for OpenShift Lightspeed. It runs the l
 1. The deployment contains a primary API container and an optional sidecar container (data collector).
 2. The primary container (lightspeed-service-api) runs the OLS service, listening on HTTPS.
 3. The data collector sidecar (lightspeed-to-dataverse-exporter) is added when data collection is enabled AND the telemetry pull secret exists in the openshift-config namespace with a cloud.openshift.com auth entry.
-4. The OpenShift MCP server runs as a standalone HTTPS Deployment/Service (`ocpmcp` package) when `spec.ols.introspectionEnabled` is true. The app-server connects via `https://openshift-mcp-server.<ns>.svc:8443/mcp` and trusts client CA Secret `lightspeed-agentic-mcp-ca` (cluster service-ca PEM). See `ocpmcp.md`.
-5. OKP (Offline Knowledge Portal) / Solr hybrid RAG is operator-managed (no CR toggle besides `byokRAGOnly`). When OKP is enabled, the RHOKP standalone Deployment serves Solr via HTTPS at `https://lightspeed-rhokp.<ns>.svc:8443`. The app-server connects as a client, trusting client CA Secret `lightspeed-agentic-rhokp-ca` (cluster service-ca PEM) via `extra_ca`. OKP is on by default; set `spec.ols.byokRAGOnly` to true to skip the RHOKP standalone operand, `solr_hybrid` config, and OCP documentation retrieval via Solr. See `rhokp.md`.
+4. The OpenShift MCP server runs as a standalone HTTPS Deployment/Service (`ocpmcp` package) when `spec.ols.introspectionEnabled` is true. The app-server connects via `https://openshift-mcp-server.<ns>.svc:8443/mcp` and trusts classic client CA Secret `lightspeed-mcp-client-ca` (cluster service-ca PEM; `mcp-ca.crt` projected as `service-ca.crt`). See `ocpmcp.md`.
+5. OKP (Offline Knowledge Portal) / Solr hybrid RAG is operator-managed (no CR toggle besides `byokRAGOnly`). When OKP is enabled, the RHOKP standalone Deployment serves Solr via HTTPS at `https://lightspeed-rhokp.<ns>.svc:8443`. The app-server connects as a client, trusting classic client CA Secret `lightspeed-rhokp-client-ca` (cluster service-ca PEM) via `extra_ca`. OKP is on by default; set `spec.ols.byokRAGOnly` to true to skip the RHOKP standalone operand, `solr_hybrid` config, and OCP documentation retrieval via Solr. See `rhokp.md`.
 6. A PostgreSQL wait init container always runs before the main containers to ensure database readiness.
 6a. [PLANNED: OLS-3799] When `byokRAGOnly` is false, a RHOKP wait init container runs after the PostgreSQL wait init container and before the main containers. It polls the RHOKP Solr ping endpoint until it responds, with a timeout matching RHOKP's startup probe budget (~360s). This follows the existing PostgreSQL wait pattern and ensures the app-server main process does not start until RHOKP is reachable. (Not yet implemented; app-server init containers are currently PostgreSQL wait + RAG only.)
 7. When `spec.ols.rag` is configured, additional init containers copy BYOK RAG data from container images into a shared volume.
@@ -34,7 +34,7 @@ The App Server is the backend deployment for OpenShift Lightspeed. It runs the l
   - RBAC: operator requires `get` on `consoles` (`operator.openshift.io`) and `infrastructures` (`config.openshift.io`).
 
 ### MCP Server Integration
-16. When `spec.ols.introspectionEnabled` is true, an "openshift" MCP server entry is added to the config pointing at the standalone Service URL (`https://openshift-mcp-server.<ns>.svc:8443/mcp`).
+16. When `spec.ols.introspectionEnabled` is true (default), an "openshift" MCP server entry is added to the config pointing at the standalone Service URL (`https://openshift-mcp-server.<ns>.svc:8443/mcp`) with `Authorization: kubernetes`, a placeholder resolved by the service at runtime.
 17. When the MCPServer feature gate is enabled, user-defined servers from `spec.mcpServers` are added to the config.
 18. MCP header values of type "secret" are mounted as files from the referenced secret. Types "kubernetes" and "client" use placeholder strings that the service resolves at runtime.
 
@@ -49,7 +49,7 @@ The App Server is the backend deployment for OpenShift Lightspeed. It runs the l
 
 ### Change Detection
 24. Deployment updates are triggered when: the deployment spec changes, the config ConfigMap resource version changes, or the proxy CA certificate hash changes.
-25. Client CA Secrets (OTEL, MCP, RHOKP) are refreshed via the table-driven `RefreshClientCASecrets` in `RestartAppServer`. The watcher detects TLS secret rotation and invokes `RestartAppServer`, which re-reads the service-ca ConfigMap and updates each enabled client CA Secret. No hash annotation is stored on the Deployment.
+25. `RestartAppServer` refreshes applicable classic and agentic client CA Secrets before rolling, and skips the roll on refresh failure. It does not touch the handoff ConfigMap; serving-cert watchers invoke a separate agentic-gated callback even after restart errors. The app-server tracks neither MCP CA hashes nor MCP TOML ConfigMap ResourceVersions. See [tls.md](tls.md).
 26. When any change is detected, the operator forces a rolling restart by updating a pod template annotation with the current timestamp.
 
 ### Health Probes
@@ -106,9 +106,9 @@ The App Server is the backend deployment for OpenShift Lightspeed. It runs the l
 
 ### Agentic Sandbox Configuration Handoff
 
-34. Classic→agentic sandbox connectivity is published via the handoff ConfigMap `lightspeed-agentic-configuration` (owned by the `agenticintegration` package, reconciled last in Phase 2) plus appserver-owned client CA Secrets (`lightspeed-agentic-otel-ca`, `lightspeed-agentic-mcp-ca`, `lightspeed-agentic-rhokp-ca`). The app-server does **not** create a `lightspeed-sandbox-config` ConfigMap — the earlier OLS-3572 design under that name was superseded by OLS-3683 / OLS-3684. The handoff ConfigMap carries `sandbox-mode`, a thin `sandbox-pod-spec`, and OTEL/MCP/RHOKP endpoint + CA-Secret-name keys. See `agentic-sandbox-profile.md` for the authoritative contract.
+34. Classic→agentic sandbox connectivity is published via the handoff ConfigMap `lightspeed-agentic-configuration` (owned by the `agenticintegration` package, reconciled last in Phase 2 only when the agentic gate is Enabled) plus separate appserver-owned agentic client CA Secrets (`lightspeed-agentic-otel-ca`, `lightspeed-agentic-mcp-ca`, `lightspeed-agentic-rhokp-ca`). The app-server does **not** create a `lightspeed-sandbox-config` ConfigMap — the earlier OLS-3572 design under that name was superseded by OLS-3683 / OLS-3684. The handoff ConfigMap carries `sandbox-mode`, a thin `sandbox-pod-spec`, and OTEL/MCP/RHOKP endpoint + CA-Secret-name keys. See `agentic-sandbox-profile.md` for the authoritative contract.
 
 ## Planned Changes
 
 - [PLANNED: OLS-3799] Wait-for-rhokp init container added when `!byokRAGOnly` to block app-server startup until RHOKP Solr is reachable. See Rule 6a.
-- Classic→agentic sandbox handoff: appserver owns client CA Secrets (`lightspeed-agentic-otel-ca` / `lightspeed-agentic-mcp-ca` / `lightspeed-agentic-rhokp-ca`) and mounts them; `agenticintegration` owns the handoff ConfigMap — see `agentic-sandbox-profile.md` (OLS-3683 / OLS-3684). Optional agentic auto-injection remains deferred ([OLS-3594](https://redhat.atlassian.net/browse/OLS-3594)).
+- Classic→agentic sandbox handoff: appserver owns separate agentic client CA Secrets (`lightspeed-agentic-otel-ca` / `lightspeed-agentic-mcp-ca` / `lightspeed-agentic-rhokp-ca`); the app-server mounts classic `lightspeed-*-client-ca` Secrets instead. `agenticintegration` owns the handoff ConfigMap — see `agentic-sandbox-profile.md` (OLS-3683 / OLS-3684). Optional agentic auto-injection remains deferred ([OLS-3594](https://redhat.atlassian.net/browse/OLS-3594)).

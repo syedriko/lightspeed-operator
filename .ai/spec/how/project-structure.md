@@ -13,7 +13,7 @@
 | `internal/controller/operator_assets.go` | `ReconcileServiceMonitorForOperator()`, `ReconcileNetworkPolicyForOperator()` | Operator-level resources |
 | `internal/controller/appserver/reconciler.go` | `ReconcileAppServerResources()`, `ReconcileAppServerDeployment()` | AppServer Phase 1 + Phase 2 orchestration |
 | `internal/controller/appserver/deployment.go` | `GenerateOLSDeployment()`, `updateOLSDeployment()` | AppServer deployment generation, update detection |
-| `internal/controller/appserver/assets.go` | `GenerateOLSConfigMap()`, service/RBAC/ServiceMonitor/PrometheusRule generators, client CA Secrets, `GetMCPClientCACertHash()` | AppServer resource generation, OLS config YAML |
+| `internal/controller/appserver/assets.go` | `GenerateOLSConfigMap()`, service/RBAC/ServiceMonitor/PrometheusRule generators, `RefreshClientCASecrets()`, separate classic/agentic client CA Secrets | AppServer resource generation, OLS config YAML |
 | `internal/controller/appserver/rag.go` | `GenerateRAGInitContainers()`, `reconcileImageStreams()` | RAG init container and ImageStream management |
 | `internal/controller/postgres/reconciler.go` | `ReconcilePostgresResources()`, `ReconcilePostgresDeployment()` | PostgreSQL Phase 1 + Phase 2 |
 | `internal/controller/postgres/deployment.go` | `GeneratePostgresDeployment()` | PostgreSQL deployment generation |
@@ -83,24 +83,24 @@ OLSConfigReconciler.Reconcile()
   5. reconcileIndependentResources()  -- Phase 1: ConfigMaps, Secrets, ServiceAccounts, RBAC, NetworkPolicies (order matches code)
      +-- console.ReconcileConsoleUIResources()
      +-- postgres.ReconcilePostgresResources()
-     +-- ocpmcp.ReconcileResources()   # when introspectionEnabled; else Remove()
-     +-- rhokp.ReconcileResources()     # when !byokRAGOnly; else Remove()
+     +-- otelcollector.ReconcileOtelCollectorResources()
+     +-- ocpmcp.ReconcileResources()   # when introspectionEnabled; else Remove() only with existing MCPServerReady Reason != Disabled
+     +-- rhokp.ReconcileResources()     # when !byokRAGOnly; else Remove only if wasComponentEnabled(RHOKPReady)
      +-- agenticconsole.ReconcileAgenticConsoleUIResources()
      +-- alertsadapter.ReconcileAlertsAdapterResources()
         (opt-in via configMapRef; RemoveAlertsAdapter() when disabled; no ConfigMap validation;
          mount at /etc/alerts-adapter when CM exists)
-     +-- otelcollector.ReconcileOtelCollectorResources()
      +-- appserver.ReconcileAppServerResources()
   6. reconcileDeploymentsAndStatus()  -- Phase 2: Deployments, Services, TLS certs, status (order matches code)
      +-- console.ReconcileConsoleUIDeploymentAndPlugin()
      +-- postgres.ReconcilePostgresDeployment()
-     +-- ocpmcp.ReconcileDeployment()                      -> MCPServerReady (or NotConfigured)
+     +-- otelcollector.ReconcileOtelCollectorDeployment()  -> OtelCollectorReady
+     +-- ocpmcp.ReconcileDeployment()                      -> MCPServerReady (disabled: False/Disabled)
      +-- rhokp.ReconcileDeployment()                       -> RHOKPReady (or Disabled)
      +-- appserver.ReconcileAppServerDeployment()
-     +-- otelcollector.ReconcileOtelCollectorDeployment()  -> OtelCollectorReady
      +-- agenticconsole.ReconcileAgenticConsoleUIDeploymentAndPlugin()
      +-- alertsadapter.ReconcileAlertsAdapterDeployment()  # when configMapRef set
-     +-- agenticintegration.ReconcileAgenticIntegrationResources()  # last (separate call after loop): handoff ConfigMap only
+     +-- agenticintegration.ReconcileAgenticIntegrationResources()  # last, Enabled agentic gate only (separate call after loop): handoff ConfigMap
      +-- checkDeploymentStatus() per deployment -> build newStatus
      +-- UpdateStatusCondition()
 ```
@@ -134,10 +134,11 @@ Declarative configuration for external resource watching. Built in `cmd/main.go`
   - `lightspeed-console-plugin-cert` → chat console deployment
   - `lightspeed-agentic-console-plugin-cert` → agentic console deployment (`AgenticConsoleUIDeploymentName`)
   - Postgres TLS cert → postgres + app server
-  - `lightspeed-otel-collector-cert` → OTEL Collector + app server + agentic ConfigMap; `RestartAppServer` refreshes client CA Secrets and touches the handoff ConfigMap
-  - `openshift-mcp-server-tls` → OpenShift MCP server + app server + agentic ConfigMap; static SystemResources entry, gated by `OpenShiftMCPServerTLSWatchEnabled` when `spec.ols.introspectionEnabled` is true; same app-server refresh+touch path
-  - `lightspeed-rhokp-tls` → RHOKP + app server + agentic ConfigMap; gated by `RHOKPTLSWatchEnabled` when `!byokRAGOnly`; same refresh+touch path
-- `ConfigMaps.SystemResources`: Fixed list of system configmaps (kube-root-ca.crt, service-ca bundle)
+  - `lightspeed-otel-collector-cert` → OTEL Collector + app server + agentic ConfigMap
+  - `openshift-mcp-server-tls` → OpenShift MCP server + app server + agentic ConfigMap; static SystemResources entry, gated by `OpenShiftMCPServerTLSWatchEnabled` when `spec.ols.introspectionEnabled` is true (absent means true)
+  - `lightspeed-rhokp-tls` → RHOKP + app server + agentic ConfigMap; gated by `RHOKPTLSWatchEnabled` when `!byokRAGOnly`
+  - These three serving-cert mappings dispatch independent callbacks: operand restart, `RestartAppServer` (refresh applicable client CAs then roll), and `TouchAgenticConfiguration` (Enabled agentic gate only). Refresh failure skips the app-server roll but does not prevent the separate touch. `RestartAppServer` itself does not touch the handoff.
+- `ConfigMaps.SystemResources`: Fixed list of system configmaps (kube-root-ca.crt, service-ca bundle). Service-ca changes target app-server and PostgreSQL, without a direct handoff touch.
 - `AnnotatedSecretMapping`: Dynamic map populated from CR spec at runtime (maps secret name to deployment names)
 - `AnnotatedConfigMapMapping`: Dynamic map populated from CR spec at runtime (maps configmap name to deployment names)
 All deployment names in `AffectedDeployments` are explicit (e.g. `lightspeed-app-server`, `lightspeed-rhokp`).
@@ -165,7 +166,7 @@ The OLSConfig CR uses finalizer `ols.openshift.io/finalizer` (defined in `utils.
 1. Remove chat console UI (deactivate plugin, delete ConsolePlugin CR)
 2. Remove agentic console UI (deactivate plugin, delete ConsolePlugin CR)
 3. Remove alerts adapter operand resources (`alertsadapter.RemoveAlertsAdapter()`: deployment, namespaced RBAC, SA, NetworkPolicy, monitoring RoleBinding; AgenticRun ClusterRole/ClusterRoleBinding when the platform permits delete)
-4. Remove OpenShift MCP server operand (`ocpmcp.Remove()`: Deployment, Service, NetworkPolicy, ConfigMaps, ServiceAccount, TLS Secret)
+4. Remove OpenShift MCP server operand (`ocpmcp.Remove()`: Deployment, Service, NetworkPolicy, TOML and legacy CA ConfigMaps, ServiceAccount, TLS Secret, ServiceMonitor), then remove RHOKP
 5. List all owned resources via owner references
 6. Explicitly delete owned resources
 7. Wait up to 3 minutes for deletion (poll every 5 seconds)

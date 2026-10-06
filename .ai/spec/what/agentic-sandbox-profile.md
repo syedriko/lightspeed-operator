@@ -8,7 +8,7 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 
 ### Ownership
 
-1. Package `internal/controller/appserver` owns the client-only CA Secrets (`lightspeed-agentic-otel-ca`, `lightspeed-agentic-mcp-ca` when introspection is enabled, and `lightspeed-agentic-rhokp-ca` when OKP is enabled) and mounts them into the app-server Deployment. It copies public PEM from service-ca source ConfigMaps; serving-cert private keys are never published.
+1. Appserver owns separate classic and agentic client-only CA Secrets. The app-server mounts classic `lightspeed-otel-client-ca`, `lightspeed-mcp-client-ca` (when introspection enabled), and `lightspeed-rhokp-client-ca` (when OKP enabled), not the `lightspeed-agentic-*-ca` Secrets published for agentic consumers. All copy public service-ca PEM; serving-cert private keys are never published.
 2. Package `internal/controller/agenticintegration` owns only the handoff ConfigMap (`lightspeed-agentic-configuration`). It references CA Secret **names** in ConfigMap data; it does not create or refresh those Secrets. It does not manage sandbox Pods, SandboxClaims, or SandboxTemplates.
 3. The former OTEL client ConfigMap `lightspeed-otel-collector-client` is no longer created. OTEL endpoints and CA are published only via the handoff ConfigMap + appserver-owned CA Secrets (no dual-write). On upgrade, otelcollector Phase 1 deletes any leftover `lightspeed-otel-collector-client` ConfigMap (`IgnoreNotFound`). Likewise, ocpmcp Phase 1 / `Remove` deletes leftover `openshift-mcp-server-ca`.
 
@@ -24,10 +24,10 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 
 ### Handoff ConfigMap (`lightspeed-agentic-configuration`)
 
-1. Always reconciled **last in Phase 2** (after appserver deployment) so CA Secrets and OTEL/MCP Services exist before the ConfigMap advertises their names/endpoints.
-8a. **Create gate (reconcile path only):** first create is skipped (error/`ErrAgenticConfigurationPrerequisitesNotReady`, requeue) until the OTEL Collector Service and OTEL client CA Secret exist, and — when introspection is enabled — the MCP Service and MCP client CA Secret exist. This avoids advertising endpoints/trust refs before infrastructure is present.
-8b. **Update path:** if the ConfigMap already exists, reconcile still applies Data updates (`sandbox-mode`, `sandbox-pod-spec`, endpoint/CA keys) even when those prerequisites are temporarily unmet (e.g. OTEL Progressing).
-8c. **Watcher path:** `TouchAgenticConfiguration` is ungated (except `RestartAppServer` fail-closed on CA refresh — see Refresh / rotation).
+1. Reconciled **last in Phase 2** (after appserver) only when the agentic version gate is Enabled (completed OpenShift version at least 5.0). Disabled/Unknown gates preserve the existing handoff without mutation; Unknown schedules a retry.
+8a. **Create gate (reconcile path only):** under an Enabled agentic gate, first create is skipped (error/`ErrAgenticConfigurationPrerequisitesNotReady`, requeue) until the OTEL Collector Service and agentic OTEL CA Secret with non-empty CA key exist, and — when introspection is enabled — the MCP Service and agentic MCP CA Secret with non-empty CA key exist. This avoids advertising endpoints/trust refs before infrastructure is present.
+8b. **Update path:** under an Enabled agentic gate, if the ConfigMap already exists, reconcile still applies Data updates (`sandbox-mode`, `sandbox-pod-spec`, endpoint/CA keys) even when those prerequisites are temporarily unmet (e.g. OTEL Progressing).
+8c. **Watcher path:** `TouchAgenticConfiguration` requires an Enabled agentic gate, but does not check Service/CA prerequisites or depend on earlier restart success. A missing handoff ConfigMap is not created by touch.
 2. Keys always present:
    - `sandbox-mode` — `bare-pod` or `sandbox-claim`
    - `sandbox-pod-spec` — JSON-serialized thin `corev1.PodSpec`
@@ -44,8 +44,8 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 - `mcp-endpoint` — OpenShift MCP HTTPS Service URL
 - `mcp-ca-secret` — name of the MCP client CA Secret (`lightspeed-agentic-mcp-ca`)
 
- 1. When introspection is disabled, MCP keys are omitted. Appserver deletes the MCP client CA Secret when present.
-11b. When OKP is enabled (`!spec.ols.byokRAGOnly`, default), also set `rhokp-endpoint` (RHOKP HTTPS Service URL) and `rhokp-ca-secret` (name of the RHOKP client CA Secret, `lightspeed-agentic-rhokp-ca`). When `byokRAGOnly` is true, both keys are omitted and appserver does not publish the RHOKP CA Secret.
+ 1. When introspection is disabled and the agentic gate is Enabled, MCP keys are omitted and appserver deletes the agentic MCP client CA Secret when present. Disabled/Unknown gates preserve agentic artifacts.
+11b. When OKP is enabled (`!spec.ols.byokRAGOnly`, default), also set `rhokp-endpoint` (RHOKP HTTPS Service URL) and `rhokp-ca-secret` (name of the RHOKP client CA Secret, `lightspeed-agentic-rhokp-ca`). When `byokRAGOnly` is true and the agentic gate is Enabled, both keys are omitted and appserver deletes the agentic RHOKP CA Secret. Disabled/Unknown gates preserve existing artifacts.
 11a. [PLANNED: OLS-3491] Optional per-step instruction keys derived from `spec.agenticOLS.instructions`:
 
 - `instructions-analysis` — cluster default analysis system instructions
@@ -65,11 +65,10 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 
 ### Client-CA Secrets (appserver)
 
- 1. `lightspeed-agentic-otel-ca` — opaque Secret with sole key `otel-ca.crt` (PEM copied from `openshift-service-ca.crt` / `service-ca.crt`). Always reconciled in appserver Phase 2 before Deployment.
- 2. `lightspeed-agentic-mcp-ca` — opaque Secret with sole key `mcp-ca.crt` (same cluster service-ca PEM as OTEL). Published only when introspection is enabled; deleted when introspection is disabled.
-16a. `lightspeed-agentic-rhokp-ca` — opaque Secret with sole key `rhokp-ca.crt` (same cluster service-ca PEM). Published only when OKP is enabled (`!byokRAGOnly`); deleted when `byokRAGOnly` is true.
+ 1. With an Enabled agentic gate, appserver Phase 2 refreshes these opaque Secrets before the Deployment: OTEL `lightspeed-agentic-otel-ca` (`otel-ca.crt`), MCP `lightspeed-agentic-mcp-ca` (`mcp-ca.crt`, only with introspection), and RHOKP `lightspeed-agentic-rhokp-ca` (`rhokp-ca.crt`, only with OKP). All copy `openshift-service-ca.crt` / `service-ca.crt`.
+ 2. Under that gate, disabling introspection/OKP deletes the corresponding agentic Secret. Disabled/Unknown agentic gates skip all reads, writes, and deletes of agentic CA Secrets.
  3. Secrets contain public CA material only — never serving-cert private keys.
- 4. App-server mounts these Secrets at `/etc/certs/otel-collector-ca/`, `/etc/certs/openshift-mcp-server-ca/`, and `/etc/certs/rhokp-ca/` (projected filename `service-ca.crt` for path compatibility). There is no dedicated MCP or RHOKP inject-cabundle ConfigMap.
+ 4. App-server mounts the distinct classic Secrets at `/etc/certs/otel-collector-ca/`, `/etc/certs/openshift-mcp-server-ca/`, and `/etc/certs/rhokp-ca/`, projecting each CA key as `service-ca.crt`. There is no dedicated MCP or RHOKP inject-cabundle ConfigMap. See [tls.md](tls.md).
 
 ### Refresh / rotation
 
@@ -77,9 +76,9 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
     - OTEL: `lightspeed-otel-collector-cert` → `RestartOtelCollector` + `RestartAppServer` + `TouchAgenticConfiguration`
     - MCP: `openshift-mcp-server-tls` → MCP restart + `RestartAppServer` + `TouchAgenticConfiguration`
     - RHOKP: `lightspeed-rhokp-tls` → RHOKP restart + `RestartAppServer` + `TouchAgenticConfiguration`
-    All three targets are declared in `AffectedDeployments` for each secret; the watcher invokes them independently.
+    All three targets are declared in `AffectedDeployments` for each Secret; the watcher continues to subsequent targets after errors. Touch is agentic-gated, independent of refresh/roll success.
  2. `RestartAppServer` order: (1) refresh client CA Secrets from `openshift-service-ca.crt` (`RefreshClientCASecrets`), (2) **re-Get** the app-server Deployment (current resourceVersion), apply any caller Spec mutations, bump `force-reload`, Update. **Fail-closed:** if step (1) fails (source CA ConfigMap missing/empty), the app-server roll is skipped so pods are not rolled with stale CA material. Retry happens on a later OLSConfig reconcile or watcher event once the source CA is ready.
- 3. `TouchAgenticConfiguration` bumps `ols.openshift.io/client-ca-reload` annotation on the handoff ConfigMap so agentic-operator detects the change. It is a separate watcher callback (not part of `RestartAppServer`).
+ 3. `TouchAgenticConfiguration` bumps `ols.openshift.io/client-ca-reload` on an existing handoff ConfigMap only with an Enabled agentic gate. It is a separate watcher callback, never part of `RestartAppServer`; refresh failure skips only the app-server roll, not this callback. Changes to the service-ca bundle restart app-server and PostgreSQL without directly touching the handoff.
  4. `RestartOtelCollector` only rolls the collector; it does **not** refresh agentic artifacts (that work is on the app-server restart path).
  5. Agenticintegration ConfigMap reconcile preserves the cert-reload annotation when updating Data/Labels.
  6. Content equality skips Secret/ConfigMap updates when Data, Labels, and OwnerReferences are unchanged.
@@ -97,7 +96,8 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 | --- | --- | --- |
 | Handoff ConfigMap | `lightspeed-agentic-configuration` | `agenticintegration` |
 | OTEL client-CA Secret | `lightspeed-agentic-otel-ca` (`otel-ca.crt`) | `appserver` |
-| MCP client-CA Secret | `lightspeed-agentic-mcp-ca` (`mcp-ca.crt`) | `appserver` |
+| Agentic MCP client-CA Secret | `lightspeed-agentic-mcp-ca` (`mcp-ca.crt`) | `appserver` |
+| Classic MCP client-CA Secret | `lightspeed-mcp-client-ca` (`mcp-ca.crt` projected as `service-ca.crt`) | `appserver` |
 | RHOKP client-CA Secret | `lightspeed-agentic-rhokp-ca` (`rhokp-ca.crt`) | `appserver` |
 | Sandbox container (in PodSpec) | `lightspeed-agentic-sandbox` | (embedded in ConfigMap) |
 
@@ -109,7 +109,7 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 | `spec.agenticOLS.agenticSandboxConfig` | Resources / tolerations / nodeSelector for thin PodSpec |
 | `spec.agenticOLS.terminalTTL` | Optional admin ceiling in positive whole days; published as `terminal-ttl-days` |
 | `spec.agenticOLS.instructions.*` | [PLANNED: OLS-3491] Optional cluster per-step system instructions → ConfigMap `instructions-*` keys |
-| `spec.ols.introspectionEnabled` | Gates MCP keys and MCP client CA Secret |
+| `spec.ols.introspectionEnabled` | Gates MCP keys and MCP client CA Secrets; agentic mutations also require Enabled version gate |
 | `spec.ols.additionalCAConfigMapRef` | Conditionally publishes the referenced ConfigMap name as `additional-ca-configmap` |
 | `spec.ols.guardrails.toolResultInspection.enabled` | [PLANNED: OLS-3928] Publishes `tool-output-inspection-enabled`; defaults to `true` |
 | `--agentic-sandbox-image` | Sandbox container image in thin PodSpec |
@@ -119,7 +119,7 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 1. Classic operator does not create SandboxTemplate or manage sandbox lifecycle.
 2. No raw user-editable full PodSpec on OLSConfig.
 3. Serving Secrets must not be published for agentic mount (private key risk).
-4. OTEL collector remains always deployed; handoff OTEL keys are always present regardless of `spec.audit.logging`.
+4. OTEL collector remains always deployed; OTEL keys are always present in a published handoff regardless of `spec.audit.logging`; handoff publication still requires an Enabled agentic gate.
 5. `RestartAppServer` is fail-closed on client CA refresh failure (see Refresh / rotation).
 
 ## Out of Scope
@@ -135,9 +135,11 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 ## Cross-References
 
 - `what/templog.md` — collector operand; OTEL connectivity consumed via this handoff
-- `what/ocpmcp.md` — MCP Service and CA source for MCP handoff keys
-- `what/reconciliation.md` — Phase 2 ordering (appserver then agenticintegration)
-- `what/tls.md` — service-ca PEM sources and rotation
+- [ocpmcp.md](ocpmcp.md) — MCP Service and distinct classic/agentic trust
+- [reconciliation.md](reconciliation.md) — Phase 2 ordering (OTEL before MCP/appserver, handoff last under Enabled gate)
+- [tls.md](tls.md) — service-ca PEM sources and independent rotation callbacks
+- [reconciliation architecture](../how/reconciliation.md) — version/create gates and watcher dispatch
+- [deployment generation](../how/deployment-generation.md) — classic CA mounts and MCP tracked versions
 - `how/project-structure.md` — `appserver` / `agenticintegration` packages
 - `what/agentic-data-collection.md` — collection gate and unchanged-handoff contract
 

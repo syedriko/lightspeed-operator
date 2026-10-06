@@ -41,7 +41,7 @@ The operator enforces security boundaries through RBAC, network policies, pod se
 
 ### OpenShift MCP Server Security
 16. The shipped OpenShift MCP server is configured via a TOML config file (`read_only = false`, denied Secret/RBAC resources) so the LLM can use core write tools (e.g. `resources_create_or_update`) while secret data stays blocked at the server level. The standalone MCP Deployment (`ocpmcp`) does not pass `--read-only` on the command line; `read_only = false` in TOML overrides the RHEL image build default of `ReadOnly: true`.
-17. The denied resources are configured in the `openshift-mcp-server-config` ConfigMap as a TOML config with entries blocking `core/v1/secrets`, `rbac.authorization.k8s.io/v1/roles`, `rbac.authorization.k8s.io/v1/rolebindings`, `rbac.authorization.k8s.io/v1/clusterroles`, and `rbac.authorization.k8s.io/v1/clusterrolebindings`.
+17. The `openshift-mcp-server-config` TOML denies core/v1 `Secret` and the entire `rbac.authorization.k8s.io/v1` API group (the RBAC entry omits `kind`). Toolsets are explicitly pinned and caller credentials determine authorization; enabling write tools does not grant permissions. See [ocpmcp.md](ocpmcp.md) for the current toolsets and metrics query guardrails.
 18. User-defined MCP servers (via `spec.mcpServers`) are the user's responsibility to secure.
 
 ## Configuration Surface

@@ -33,7 +33,7 @@ GenerateOLSDeployment(r, cr)
       a. PostgreSQL wait init container (polls pg service)
       b. RAG init containers (one per RAG entry, copies data to shared emptyDir)
       c. [PLANNED: OLS-3799] RHOKP wait init container (when `!byokRAGOnly`) — not yet implemented; today only the PostgreSQL wait + RAG init containers are generated.
-  13. Get ConfigMap ResourceVersions for tracking annotations
+  13. Get OLS config ConfigMap ResourceVersion for tracking (not the MCP TOML ConfigMap)
   14. Get proxy CA cert hash for tracking annotation
   15. Assemble Deployment:
       - Container: "lightspeed-service-api", image: r.GetAppServerImage(), port: 8443
@@ -46,8 +46,8 @@ GenerateOLSDeployment(r, cr)
   17. Set ImageStream triggers annotation (if RAG configured)
   18. Set owner reference to OLSConfig CR
   19. Conditionally add data collector sidecar container ("lightspeed-to-dataverse-exporter")
-  20. When `!byokRAGOnly`, mount the RHOKP client CA Secret `lightspeed-agentic-rhokp-ca` at `/etc/certs/rhokp-ca/` (added to `extra_ca`). RHOKP itself runs as a standalone Deployment (`internal/controller/rhokp/`, HTTPS `:8443`), not an app-server sidecar — see `rhokp.md`.
-  21. When introspection is enabled, mount MCP client CA Secret `lightspeed-agentic-mcp-ca` (no MCP sidecar; standalone operand).
+  20. Mount classic OTEL CA Secret `lightspeed-otel-client-ca` at `/etc/certs/otel-collector-ca/`; when `!byokRAGOnly`, mount classic RHOKP CA Secret `lightspeed-rhokp-client-ca` at `/etc/certs/rhokp-ca/`. Their keys (`otel-ca.crt` / `rhokp-ca.crt`) project to `service-ca.crt`, referenced by `extra_ca`; OTEL also uses `OTEL_EXPORTER_OTLP_CERTIFICATE`. RHOKP is standalone, not a sidecar — see ../what/rhokp.md.
+  21. When introspection is enabled, mount classic MCP CA Secret `lightspeed-mcp-client-ca` using `AgenticMCPCASecretDataKey` (`mcp-ca.crt`) projected as `AppOpenShiftMCPServerCACertFile` (`service-ca.crt`) in `/etc/certs/openshift-mcp-server-ca/`. No MCP sidecar or agentic CA Secret mount.
 ```
 
 ### OTEL Collector Deployment — Agentic Collection
@@ -61,16 +61,24 @@ GenerateOLSDeployment(r, cr)
 5. [PLANNED: OLS-3569] When disabled, omit the Agentic pipeline, sidecar, `emptyDir`, and both mounts. A gate transition changes the desired pod template and follows the normal Collector rollout path.
 6. [PLANNED: OLS-3569] Do not change the app-server exporter or add collection state to `lightspeed-agentic-configuration`. See `what/agentic-data-collection.md` for the operator contract and its parent-spec references.
 
-### Change Detection Pattern
-All deployments use the same pattern in their update functions:
-1. Compare desired vs existing deployment spec using `DeploymentSpecEqual()` (from `utils/`)
-2. Compare ConfigMap ResourceVersions via deployment annotations (one per tracked CM)
-3. Compare content hashes (proxy CA cert hash; OpenShift MCP CA hash when introspection is enabled) via annotations
-4. If any differ: update spec + annotations, call RestartX() function
-   - RestartX() sets `ols.openshift.io/force-reload` annotation to `time.Now().Format(time.RFC3339Nano)`
-   - This triggers a rolling restart by changing the pod template
+### AppServer Phase 2 Task Order
+`ReconcileAppServerDeployment()` in `appserver/reconciler.go` executes fail-fast: `RefreshClientCASecrets`, exporter ConfigMap, Deployment, Service, TLS certificates, ServiceMonitor, PrometheusRule. Client CA refresh precedes Deployment generation; it is also the first step in `RestartAppServer()`.
 
-**AppServer tracks:** OLS config CM version, MCP server config CM version, proxy CA cert hash, MCP client CA Secret content hash (when introspection is enabled)
+### Standalone MCP Deployment and Client Wiring
+- `ocpmcp.GenerateConfigMap()` writes `config.toml` from `configTOML` in `internal/controller/ocpmcp/assets.go`. Current toolsets: `["core", "config", "helm", "observability/metrics", "kubevirt"]`. It sets `read_only = false`, `experimental_enable_target_compatibility_tool_filters = true`, port `8443`, `tls_cert = "/etc/tls/tls.crt"`, and `tls_key = "/etc/tls/tls.key"`. It denies core/v1 Secret and rbac.authorization.k8s.io/v1 resources. `[toolset_configs."observability/metrics"]` supplies Thanos/Alertmanager URLs and `guardrails = "!tsdb"`.
+- `ocpmcp.GenerateDeployment()` starts `/openshift-mcp-server --config /etc/mcp-server/config.toml`; no `--tls-cert` / `--tls-key` flags. It mounts TOML, serving Secret `openshift-mcp-server-tls` at `/etc/tls`, and `/tmp` EmptyDir, with HTTPS `/healthz` probes and `PullIfNotPresent`.
+- MCP Phase 2 is fail-fast: Service, TLS-key wait, Deployment, ServiceMonitor. The monitor scrapes port `https`, path `/metrics`, interval `30s`, validating `openshift-mcp-server.<ns>.svc` against `/etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt`, without client certificate or bearer token. `utils.ReconcileServiceMonitor()` skips unavailable Prometheus CRDs. See [ocpmcp.md](../what/ocpmcp.md).
+- `appserver.generateMCPServerConfigs()` emits the built-in `openshift` endpoint via `utils.OpenShiftMCPServerServiceURL()`. Headers use `utils.K8S_AUTH_HEADER` (`Authorization`) mapped to `utils.KUBERNETES_PLACEHOLDER` (`kubernetes`), not a literal token. User header types `kubernetes` and `client` use `KUBERNETES_PLACEHOLDER` / `CLIENT_PLACEHOLDER` (`client`); secret headers resolve to file paths. See [app-server.md](../what/app-server.md).
+- `RefreshClientCASecrets()` in `appserver/assets.go` uses separate table entries for classic `lightspeed-*-client-ca` and agentic `lightspeed-agentic-*-ca`. Classic OTEL is always enabled, MCP follows introspection, RHOKP follows `!byokRAGOnly`. Agentic entries require Enabled `AgenticGate`; Disabled/Unknown skip reads/writes/deletes. With Enabled, MCP/RHOKP opt-out deletes their agentic Secret. Source PEM is `openshift-service-ca.crt` / `service-ca.crt`.
+
+### Change Detection Pattern
+Deployment update functions compare desired vs existing specs via `DeploymentSpecEqual()` and component-specific tracked inputs. A detected change updates spec/tracking annotations and sets pod-template `ols.openshift.io/force-reload` to RFC3339Nano to roll pods, either directly or through a component restart function.
+
+**AppServer tracks:** OLS config CM ResourceVersion (`OLSConfigMapResourceVersionAnnotation`), proxy CA content hash (`ProxyCACertHashAnnotation`), RAG spec hash (`RAGSpecHashAnnotation`), and desired Deployment spec. It does **not** track MCP TOML ConfigMap ResourceVersion or any MCP CA hash.
+
+**MCP tracks:** TOML ConfigMap ResourceVersion (`OpenShiftMCPServerConfigMapResourceVersionAnnotation`, `ols.openshift.io/mcp-server-configmap-version`) and TLS Secret ResourceVersion (`OpenShiftMCPServerTLSSecretResourceVersionAnnotation`, `ols.openshift.io/mcp-server-tls-secret-version`) on Deployment metadata, plus desired spec. `UpdateDeployment()` copies both annotations, stamps force-reload directly on the pod template, and persists a single Update when any tracked input changes. It does not call `Restart()`; that function is used by TLS watchers and re-fetches the Deployment.
+
+**AppServer restart:** Get OLSConfig, `RefreshClientCASecrets()`, re-Get Deployment, apply optional caller Spec/object-annotation mutations, set force-reload, Update. Refresh failure skips roll. No direct handoff touch occurs; serving-cert watchers dispatch a separate Enabled-agentic-gated `TouchAgenticConfiguration()` callback and continue to it after errors. Service-ca ConfigMap changes target app-server and PostgreSQL only. See [reconciliation.md](reconciliation.md).
 
 ## Key Abstractions
 
@@ -123,7 +131,7 @@ Affinity and topology spread constraints are not exposed on `Config` (CRD size);
 | RHOKP resources | CR `spec.ols.deployment.rhokp.resources` | User-overridable CPU/memory/ephemeral storage |
 | Pod scheduling | CR `spec.ols.deployment.api` | Tolerations, nodeSelector |
 | Volume secrets | Kubernetes Secrets | LLM credentials, TLS certs, PostgreSQL password, MCP header values |
-| Volume configmaps | Generated ConfigMaps | OLS config, nginx config, MCP server config; [PLANNED: OLS-3569] existing exporter config also mounted by the Collector-side Agentic exporter |
+| Volume configmaps | Generated ConfigMaps | OLS config, nginx config; MCP TOML is mounted only by the standalone MCP Deployment; [PLANNED: OLS-3569] existing exporter config also mounted by the Collector-side Agentic exporter |
 | Proxy env vars | `utils.GetProxyEnvVars()` | HTTP_PROXY, HTTPS_PROXY, NO_PROXY from cluster |
 | RAG images | CR `spec.ols.rag[].image` | Container images for init containers |
 | RHOKP image | `--rhokp-image` flag | Standalone RHOKP Deployment container image; default from `related_images.json` (`rhokp`) |

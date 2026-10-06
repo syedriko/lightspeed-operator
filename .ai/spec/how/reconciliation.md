@@ -16,32 +16,34 @@ Main reconciliation loop:
 Reconcile(ctx, req)
   -> getAndValidateCR()                    # Fetch CR, validate name == "cluster"
   -> handleFinalizer()                      # Add/remove finalizer, run cleanup
+  -> ReadAgenticVersion() / WithAgenticVersion() # completed-version gate snapshot; Unknown retries
   -> reconcileOperatorResources()           # ServiceMonitor, NetworkPolicy (operator-level)
   -> annotateExternalResources()            # Validate secrets, annotate for watching
   -> reconcileIndependentResources()        # Phase 1 (continue-on-error; order below matches code)
   |   |-- console.ReconcileConsoleUIResources()
   |   |-- postgres.ReconcilePostgresResources()
-  |   |-- ocpmcp.ReconcileResources()
-  |   |   (when introspectionEnabled; else ocpmcp.Remove())
-  |   |-- rhokp.ReconcileResources()
-  |   |   (when !byokRAGOnly; else rhokp.Remove())
-  |   |-- agenticconsole.ReconcileAgenticConsoleUIResources()
-  |   |-- alertsadapter.ReconcileAlertsAdapterResources()
-  |   |   (opt-in via configMapRef; RemoveAlertsAdapter() when disabled; no ConfigMap validation;
-  |   |    mount at /etc/alerts-adapter when CM exists)
   |   |-- otelcollector.ReconcileOtelCollectorResources()
+  |   |-- ocpmcp.ReconcileResources()
+  |   |   (when introspectionEnabled; else Remove only if wasComponentEnabled(MCPServerReady))
+  |   |-- rhokp.ReconcileResources()
+  |   |   (when !byokRAGOnly; else Remove only if wasComponentEnabled(RHOKPReady))
+  |   |-- agenticconsole.ReconcileAgenticConsoleUIResources() # Enabled agentic gate + image
+  |   |-- alertsadapter.ReconcileAlertsAdapterResources() # Enabled agentic gate + image
+  |   |   (opt-in via configMapRef; cleanup only with Enabled gate and previous non-Disabled condition;
+  |   |    no ConfigMap validation;
+  |   |    mount at /etc/alerts-adapter when CM exists)
   |   +-- appserver.ReconcileAppServerResources()
   -> reconcileDeploymentsAndStatus()        # Phase 2: deployments + status update (order below matches code)
       |-- console.ReconcileConsoleUIDeploymentAndPlugin()   # ConsolePluginReady
       |-- postgres.ReconcilePostgresDeployment()            # CacheReady
-      |-- ocpmcp.ReconcileDeployment()                      # MCPServerReady / NotConfigured
-      |-- rhokp.ReconcileDeployment()                       # RHOKPReady / NotConfigured
-      |-- appserver.ReconcileAppServerDeployment()          # ApiReady (MCP/RHOKP Services already reconciled)
       |-- otelcollector.ReconcileOtelCollectorDeployment()  # OtelCollectorReady
-      |-- agenticconsole.ReconcileAgenticConsoleUIDeploymentAndPlugin() # AgenticConsolePluginReady
-      |-- alertsadapter.ReconcileAlertsAdapterDeployment()  # when configMapRef set
+      |-- ocpmcp.ReconcileDeployment()                      # MCPServerReady; disabled => False/Disabled
+      |-- rhokp.ReconcileDeployment()                       # RHOKPReady; disabled => False/Disabled
+      |-- appserver.ReconcileAppServerDeployment()          # ApiReady (OTEL/MCP/RHOKP Services attempted first)
+      |-- agenticconsole.ReconcileAgenticConsoleUIDeploymentAndPlugin() # Enabled agentic gate + image
+      |-- alertsadapter.ReconcileAlertsAdapterDeployment()  # Enabled agentic gate + image + configMapRef
       |   (each deployment step above: checkDeploymentStatus → conditions)
-      |-- agenticintegration.ReconcileAgenticIntegrationResources()  # last (separate call after the loop): ConfigMap only — no deployment health check; failure → OverallStatus NotReady
+      |-- agenticintegration.ReconcileAgenticIntegrationResources()  # Enabled agentic gate only; last, after loop: ConfigMap only; failure → OverallStatus NotReady
       +-- UpdateStatusCondition()           # Single status update
 ```
 
@@ -59,7 +61,20 @@ Two ownership models:
 2. **External resources**: Watches() with custom predicates. Annotation-based filtering. Secret/ConfigMap handlers compare data and trigger deployment restarts on update. Deletes of referenced external resources or configured system resources enqueue OLSConfig reconcile so credentials/CA can be re-validated.
 
 ### Finalizer Cleanup
-The `finalizeOLSConfig()` method removes Console UI, deletes alerts adapter operand resources via `alertsadapter.RemoveAlertsAdapter()` (deployment, namespaced RBAC, SA, NetworkPolicy, cross-namespace monitoring RoleBinding; AgenticRun ClusterRole/ClusterRoleBinding when permitted—may remain on managed OpenShift if admission webhook blocks delete), then uses `listOwnedResources()` which queries every resource type by owner reference UID (not labels). This is more reliable than label-based cleanup. The wait loop polls with a fixed interval and timeout, using `wait.PollUntilContextTimeout`.
+`finalizeOLSConfig()` runs before version gating: chat console removal, agentic console removal, alerts adapter removal, `ocpmcp.Remove()`, `rhokp.Remove()`, then `listOwnedResources()` / delete / wait. MCP removal deletes Deployment, Service, NetworkPolicy, TOML ConfigMap, ServiceAccount, TLS Secret, ServiceMonitor, and legacy CA ConfigMap. Component removal errors are logged; alerts-adapter pending cleanup retries until timeout.
+
+The sweep matches OwnerReference UID, not labels. Its exact namespaced lists are Deployments, PVCs, Services, ConfigMaps, Secrets (including classic/agentic client CAs), ServiceAccounts, NetworkPolicies, Roles, RoleBindings, ServiceMonitors, and PrometheusRules. Monitoring list errors are ignored. It is not an enumeration of all `Owns()` types: ConsolePlugins are explicitly removed; ClusterRoles/ClusterRoleBindings rely on operand cleanup or garbage collection; ImageStreams are not listed. The wait loop uses `wait.PollUntilContextTimeout`.
+
+### MCP Disable and Agentic Gates
+- `wasComponentEnabled(cr, TypeMCPServerReady)` returns true only when that condition exists and its `Reason != "Disabled"`; it does not test condition Status. Disabled introspection invokes `ocpmcp.Remove()` during Phase 1 step construction only under this predicate, before the task loop. Phase 2 always emits `MCPServerReady=False`, `Reason=Disabled` without making OverallStatus NotReady solely for that condition.
+- `ReadAgenticVersion` in `utils/utils.go` requires the newest history entry to be Completed and match `status.desired.version`. Parsed major >= 5 is Enabled, earlier releases Disabled, unreadable/incomplete/mismatched versions Unknown. Normal reconciliation snapshots this in context; Unknown skips agentic mutations and schedules a retry. Classic MCP is gated by introspection, not by this agentic gate.
+- Only Enabled allows handoff reconciliation, handoff touch, or agentic client CA Secret reconciliation. Disabled/Unknown preserve existing agentic artifacts, including Secrets on operand opt-out.
+- First handoff create checks OTEL Service and non-empty `otel-ca.crt` in `lightspeed-agentic-otel-ca`, plus (when introspection enabled) MCP Service and non-empty `mcp-ca.crt` in `lightspeed-agentic-mcp-ca`. Existing ConfigMap updates skip those infrastructure checks, but still require the Enabled version gate. See [agentic-sandbox-profile.md](../what/agentic-sandbox-profile.md).
+
+### TLS Watcher Callbacks
+`cmd/main.go` statically lists `openshift-mcp-server-tls`; `syncOpenShiftMCPServerTLSWatcher()` atomically toggles `OpenShiftMCPServerTLSWatchEnabled` from introspection without rewriting the list. Its targets are MCP restart, app-server restart, then handoff touch. OTEL/RHOKP serving Secrets use the analogous three targets.
+
+`watchers.restartDeployment()` dispatches each target via `restartFuncs` and continues after errors. `RestartAppServer()` refreshes applicable client CA Secrets, re-fetches the Deployment, applies caller mutations, and rolls; refresh failure stops that callback before rolling. It does not call `TouchAgenticConfiguration()`. The separate touch callback still runs after earlier errors, but returns without mutation unless `AgenticGate` is Enabled; it skips a missing ConfigMap and checks no infrastructure prerequisites. `openshift-service-ca.crt` targets only app-server and PostgreSQL, with no direct handoff touch. See [deployment-generation.md](deployment-generation.md) for CA mounts and tracked versions.
 
 ### Status Update Mechanics
 `UpdateStatusCondition()` uses `retry.RetryOnConflict` with `client.MergeFrom` patch. It preserves `LastTransitionTime` for conditions whose status hasn't changed. It re-fetches the CR before each update attempt to get the latest ResourceVersion.

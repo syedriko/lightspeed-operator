@@ -8,24 +8,24 @@ Standalone HTTPS RHOKP operand managed by the `rhokp` package ([OLS-3697](https:
 lightspeed-service (app-server)
   └─ HTTPS Solr client
        url: https://lightspeed-rhokp.<ns>.svc:8443/solr/portal-rag/hybrid-search
-       trust: /etc/certs/rhokp-ca/service-ca.crt  (extra_ca, from Secret lightspeed-agentic-rhokp-ca)
+       trust: /etc/certs/rhokp-ca/service-ca.crt  (extra_ca, from Secret lightspeed-rhokp-client-ca)
             │
             ▼
 lightspeed-rhokp Deployment + ClusterIP Service (:8443)
   ├─ service-ca serving cert Secret  lightspeed-rhokp-tls
-  └─ NetworkPolicy                   lightspeed-rhokp
+  └─ NetworkPolicies                lightspeed-rhokp (ingress), lightspeed-rhokp-egress
 ```
 
-Gated by `!spec.ols.byokRAGOnly` (default: OKP enabled). When `byokRAGOnly` is true, the operator removes managed RHOKP resources and omits `solr_hybrid` config.
+Gated by `!spec.ols.byokRAGOnly` (default: OKP enabled). When `byokRAGOnly` is true, the operator omits `solr_hybrid` config and removes managed RHOKP resources only under the previous-condition predicate in rule 2.
 
 ## Behavioral Rules
 
 ### Activation
 1. When `spec.ols.byokRAGOnly` is false (or absent), Phase 1 and Phase 2 reconcile the standalone RHOKP operand.
-2. When true, Phase 1 calls `rhokp.Remove()`; Phase 2 skips deployment reconciliation. The status condition `RHOKPReady=False, Reason=Disabled` is emitted to signal that RHOKP is intentionally off.
+2. When true, Phase 1 calls `rhokp.Remove()` only if an existing `RHOKPReady` condition has `Reason != Disabled` (regardless of Status); no condition or an already Disabled condition skips removal. Phase 2 skips deployment reconciliation. The status condition `RHOKPReady=False, Reason=Disabled` is emitted to signal that RHOKP is intentionally off.
 
 ### Phase 1 Resources
-3. NetworkPolicy `lightspeed-rhokp` — allows TCP `:8443` ingress from any pod in the operator namespace (including app-server and sandbox clients) and from cluster Prometheus pods in `openshift-monitoring`. The Prometheus peer requires both the namespace label `kubernetes.io/metadata.name: openshift-monitoring` and pod labels `app.kubernetes.io/name: prometheus` and `prometheus: k8s` (OLS-3943); it does not allow every pod in the monitoring namespace. This ingress policy remains ingress-only. A separate `lightspeed-rhokp-egress` policy selects the same pods and denies pod-initiated egress. Both policies are removed when `byokRAGOnly` disables RHOKP. Client trust is provided by the appserver-owned Secret `lightspeed-agentic-rhokp-ca`, not an inject-cabundle ConfigMap — see rule 16 and `agentic-sandbox-profile.md`.
+3. NetworkPolicy `lightspeed-rhokp` — allows TCP `:8443` ingress from any pod in the operator namespace (including app-server and sandbox clients) and from cluster Prometheus pods in `openshift-monitoring`. The Prometheus peer requires both the namespace label `kubernetes.io/metadata.name: openshift-monitoring` and pod labels `app.kubernetes.io/name: prometheus` and `prometheus: k8s` (OLS-3943); it does not allow every pod in the monitoring namespace. This ingress policy remains ingress-only. A separate `lightspeed-rhokp-egress` policy selects the same pods and denies pod-initiated egress. Both policies are deleted by `rhokp.Remove()` (disable cleanup follows rule 2). Client trust uses appserver-owned Secrets: classic `lightspeed-rhokp-client-ca` and distinct, agentic-gated `lightspeed-agentic-rhokp-ca`, not an inject-cabundle ConfigMap — see rule 16 and `agentic-sandbox-profile.md`.
 
 ### Phase 2 Resources
 5. Service `lightspeed-rhokp` — ClusterIP, port `https` `:8443`, serving-cert annotation → Secret `lightspeed-rhokp-tls`.
@@ -43,22 +43,22 @@ Gated by `!spec.ols.byokRAGOnly` (default: OKP enabled). When `byokRAGOnly` is t
 
 ### App-server Integration
 15. `olsconfig.yaml` `solr_hybrid.solr_http_base` is set to `https://lightspeed-rhokp.<namespace>.svc:8443` (replaces former `http://localhost:9080`).
-16. App-server mounts Secret `lightspeed-agentic-rhokp-ca` at `/etc/certs/rhokp-ca/` and adds `service-ca.crt` to `extra_ca`. See `tls.md`.
+16. App-server mounts classic Secret `lightspeed-rhokp-client-ca` at `/etc/certs/rhokp-ca/`, projecting `rhokp-ca.crt` as `service-ca.crt`, and adds it to `extra_ca`. The distinct `lightspeed-agentic-rhokp-ca` is for agentic consumers only; it is refreshed/deleted only with an Enabled agentic gate and preserved under Disabled/Unknown gates. See `tls.md`.
 17. Client CA Secrets for RHOKP are refreshed via the table-driven `RefreshClientCASecrets` in `RestartAppServer`. No hash annotation is stored on the app-server Deployment.
 
 ### Monitoring
 18. ServiceMonitor `lightspeed-rhokp-monitor` (OLS-3727) — scrapes RHOKP Solr metrics via HTTPS on port 8443, path `/solr/admin/metrics` (Solr built-in Prometheus metrics reporter). Server TLS only (service-ca CA bundle + `serverName`), 30s interval. Reconciled in Phase 2 via `utils.ReconcileServiceMonitor()`. Skipped if Prometheus Operator CRDs are not installed. The NetworkPolicy ingress in rule 3 admits the cluster Prometheus scrape (OLS-3943); the ServiceMonitor alone does not grant network access.
 
 ### Agentic Handoff
-19. When OKP is enabled, the inter-operator handoff ConfigMap (`lightspeed-agentic-configuration`) includes `rhokp-endpoint` and `rhokp-ca-secret` keys. When `byokRAGOnly` is true, both are absent.
+19. With an Enabled agentic gate, the inter-operator handoff ConfigMap (`lightspeed-agentic-configuration`) includes `rhokp-endpoint` and `rhokp-ca-secret` (`lightspeed-agentic-rhokp-ca`) when OKP is enabled; when `byokRAGOnly` is true, both keys are omitted and appserver deletes the agentic RHOKP CA Secret. Disabled/Unknown gates preserve existing agentic artifacts. See `agentic-sandbox-profile.md` for handoff create prerequisites.
 
 ### Watching and Restarts
-20. Secret `lightspeed-rhokp-tls` is watched via the operator's watcher infrastructure (same pattern as `openshift-mcp-server-tls`).
-21. On TLS Secret data change, the watcher restarts `lightspeed-rhokp`, `lightspeed-app-server` (app-server), and touches the `lightspeed-agentic-configuration` ConfigMap.
+20. Secret `lightspeed-rhokp-tls` is watched via the operator's watcher infrastructure when OKP is enabled (same pattern as `openshift-mcp-server-tls`).
+21. On TLS Secret data change, independent watcher callbacks restart RHOKP, call `RestartAppServer` (refresh applicable classic CAs plus Enabled-gated agentic CAs, then roll), and call `TouchAgenticConfiguration`. Errors do not prevent later callbacks; refresh failure skips the app-server roll. `RestartAppServer` itself does not touch the handoff. Touch requires an Enabled agentic gate, skips a missing ConfigMap, and checks no Service/CA prerequisites.
 22. RHOKP Deployment tracks TLS Secret ResourceVersion and rolls when it changes.
 
 ### Finalizer
-23. On CR deletion, `rhokp.Remove()` deletes Deployment, Service, NetworkPolicy, TLS Secret (`lightspeed-rhokp-tls`), and ServiceMonitor (`lightspeed-rhokp-monitor`) before owned-resource sweep.
+23. On CR deletion, `rhokp.Remove()` deletes Deployment, Service, both NetworkPolicies, TLS Secret (`lightspeed-rhokp-tls`), and ServiceMonitor (`lightspeed-rhokp-monitor`) before owned-resource sweep.
 
 ## Configuration Surface
 

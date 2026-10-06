@@ -242,7 +242,7 @@ Field | JSON key | Go type | Required
 
 #### MCP Kubernetes Server (spec.ols.mcpKubeServerConfig)
 
-31. `spec.ols.mcpKubeServerConfig.timeout` -- `int`. Default: `60`. Minimum=5. Timeout in seconds for the built-in MCP Kubernetes server.
+31. `spec.ols.mcpKubeServerConfig.timeout` -- `int`. Default: `60`. Minimum=5. App-server client timeout in seconds for the built-in MCP Kubernetes server; not a server-runtime setting.
 
 #### Proxy Configuration (spec.ols.proxyConfig)
 
@@ -379,7 +379,7 @@ Condition types used by the operator:
 - `ConsolePluginReady` -- Console UI plugin deployment health
 - `AgenticConsolePluginReady` -- Agentic console plugin deployment health
 - `OtelCollectorReady` -- OTEL Collector deployment health
-- `MCPServerReady` -- Standalone OpenShift MCP server deployment health (`NotConfigured` when `introspectionEnabled` is false; does not block `OverallStatus=Ready`)
+- `MCPServerReady` -- Standalone OpenShift MCP server deployment health (`False`, `Reason=Disabled` when `introspectionEnabled` is false; does not block `OverallStatus=Ready`)
 - `RHOKPReady` -- Standalone RHOKP deployment health (`Disabled` when `byokRAGOnly` is true; does not block `OverallStatus=Ready`)
 - `AlertsAdapterReady` -- Agentic alerts adapter deployment health
 - `ResourceReconciliation` -- Overall resource reconciliation status (set directly, not deployment-based)

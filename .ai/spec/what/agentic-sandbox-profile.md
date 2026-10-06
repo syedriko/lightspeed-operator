@@ -10,7 +10,7 @@ See also: `templog.md` (collector), `ocpmcp.md` (MCP Service/CA), `rhokp.md` (RH
 
 1. Appserver owns separate classic and agentic client-only CA Secrets. The app-server mounts classic `lightspeed-otel-client-ca`, `lightspeed-mcp-client-ca` (when introspection enabled), and `lightspeed-rhokp-client-ca` (when OKP enabled), not the `lightspeed-agentic-*-ca` Secrets published for agentic consumers. All copy public service-ca PEM; serving-cert private keys are never published.
 2. Package `internal/controller/agenticintegration` owns only the handoff ConfigMap (`lightspeed-agentic-configuration`). It references CA Secret **names** in ConfigMap data; it does not create or refresh those Secrets. It does not manage sandbox Pods, SandboxClaims, or SandboxTemplates.
-3. The former OTEL client ConfigMap `lightspeed-otel-collector-client` is no longer created. OTEL endpoints and CA are published only via the handoff ConfigMap + appserver-owned CA Secrets (no dual-write). On upgrade, otelcollector Phase 1 deletes any leftover `lightspeed-otel-collector-client` ConfigMap (`IgnoreNotFound`). Likewise, ocpmcp Phase 1 / `Remove` deletes leftover `openshift-mcp-server-ca`.
+3. The former OTEL client ConfigMap `lightspeed-otel-collector-client` is no longer created. OTEL endpoints and CA are published only via the handoff ConfigMap + appserver-owned CA Secrets (no dual-write). On upgrade, otelcollector Phase 1 deletes any leftover `lightspeed-otel-collector-client` ConfigMap (`IgnoreNotFound`). Likewise, ocpmcp Phase 1 / `Remove` deletes leftover `openshift-mcp-server-ca` only when OLSConfig-owned and not currently referenced as a user CA. Unowned collisions remain protected even after reference removal; see [MCP cleanup](ocpmcp.md#finalizer).
 
 ### OLSConfig
 

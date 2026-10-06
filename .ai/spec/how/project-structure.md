@@ -5,6 +5,7 @@
 | Path | Key Symbols | Responsibility |
 |---|---|---|
 | `api/v1alpha1/olsconfig_types.go` | `OLSConfig`, `OLSConfigSpec`, `OLSConfigStatus`, `ProviderSpec`, `ModelSpec` | CRD type definitions, validation markers, defaults |
+| `api/v1alpha1/mcp_types.go` | `MCPToolsetSelection`, `MCPCAReference`, typed toolset configs, `MCPEmptyConfig`, `CAReferences()` | 17-selection schema/CEL validation; empty-map MaxProperties=0; Strict unknown-field caveat; local CA key references |
 | `api/v1alpha1/groupversion_info.go` | `SchemeBuilder`, `GroupVersion` | API group/version registration |
 | `api/v1alpha1/zz_generated.deepcopy.go` | Generated `DeepCopyObject()` methods | Auto-generated deep copy |
 | `cmd/main.go` | `main()`, `overrideImages()` | Operator entry point, flag parsing, manager setup |
@@ -26,6 +27,8 @@
 | `internal/controller/ocpmcp/reconciler.go` | `ReconcileResources()`, `ReconcileDeployment()`, `Remove()`, `Restart()` | Standalone OpenShift MCP Phase 1 + Phase 2 + teardown + rolling restart |
 | `internal/controller/ocpmcp/deployment.go` | `GenerateDeployment()`, `UpdateDeployment()` | MCP Deployment generation and update detection |
 | `internal/controller/ocpmcp/assets.go` | ConfigMap (TOML), Service, NetworkPolicy, ServiceAccount, `GetConfigVolumeAndMount()`, `GetConfigPath()` | MCP resource generation |
+| `internal/controller/ocpmcp/config.go` | `GenerateConfigTOML()` | Typed replacement selection and selected-table TOML generation; retained security policy |
+| `internal/controller/ocpmcp/trust.go` | `GenerateTrustConfigMap()`, `canonicalCABundle()`, `trustVolumes()` | Validated public-only owned CA snapshot, selected-key projections, content/reference-identity hash and ownership guards |
 | `internal/controller/console/reconciler.go` | `ReconcileConsoleUIResources()`, `ReconcileConsoleUIDeploymentAndPlugin()`, `RemoveConsoleUI()` | Chat console plugin Phase 1 + Phase 2 + cleanup |
 | `internal/controller/console/deployment.go` | `GenerateConsoleUIDeployment()` | Chat console plugin deployment generation |
 | `internal/controller/console/assets.go` | ConsolePlugin CR generator, nginx config, service, network policy | Chat console plugin resource generation |
@@ -84,7 +87,7 @@ OLSConfigReconciler.Reconcile()
      +-- console.ReconcileConsoleUIResources()
      +-- postgres.ReconcilePostgresResources()
      +-- otelcollector.ReconcileOtelCollectorResources()
-     +-- ocpmcp.ReconcileResources()   # when introspectionEnabled; else Remove() only with existing MCPServerReady Reason != Disabled
+     +-- ocpmcp.ReconcileResources()   # when introspectionEnabled; else always attempt idempotent Remove(), no condition-history gate
      +-- rhokp.ReconcileResources()     # when !byokRAGOnly; else Remove only if wasComponentEnabled(RHOKPReady)
      +-- agenticconsole.ReconcileAgenticConsoleUIResources()
      +-- alertsadapter.ReconcileAlertsAdapterResources()
@@ -117,7 +120,8 @@ External secret/configmap changes
      -> If changed: SecretWatcherFilter() / ConfigMapWatcherFilter()
         -> Match against SystemResources list (by name+namespace)
         -> OR match against WatcherAnnotationKey annotation
-        -> Call restart function for each affected deployment (appserver, OTEL, MCP, RHOKP, etc.)
+        -> For MCP CA inputs: enqueue reconciliation/validation before MCP roll; union other consumers
+        -> Otherwise call restart function for each affected deployment (appserver, OTEL, MCP TLS, RHOKP, etc.)
            -> Set force-reload annotation with current timestamp
         -> If applicable, call TouchAgenticConfiguration() to update the handoff ConfigMap timestamp
 ```
@@ -138,10 +142,10 @@ Declarative configuration for external resource watching. Built in `cmd/main.go`
   - `openshift-mcp-server-tls` → OpenShift MCP server + app server + agentic ConfigMap; static SystemResources entry, gated by `OpenShiftMCPServerTLSWatchEnabled` when `spec.ols.introspectionEnabled` is true (absent means true)
   - `lightspeed-rhokp-tls` → RHOKP + app server + agentic ConfigMap; gated by `RHOKPTLSWatchEnabled` when `!byokRAGOnly`
   - These three serving-cert mappings dispatch independent callbacks: operand restart, `RestartAppServer` (refresh applicable client CAs then roll), and `TouchAgenticConfiguration` (Enabled agentic gate only). Refresh failure skips the app-server roll but does not prevent the separate touch. `RestartAppServer` itself does not touch the handoff.
-- `ConfigMaps.SystemResources`: Fixed list of system configmaps (kube-root-ca.crt, service-ca bundle). Service-ca changes target app-server and PostgreSQL, without a direct handoff touch.
+- `ConfigMaps.SystemResources`: Fixed list of system configmaps (kube-root-ca.crt, service-ca bundle). Service-ca changes retain app-server/PostgreSQL targets and enqueue MCP CA validation whenever MCP is enabled, independently of NetObserv, without a direct handoff touch.
 - `AnnotatedSecretMapping`: Dynamic map populated from CR spec at runtime (maps secret name to deployment names)
 - `AnnotatedConfigMapMapping`: Dynamic map populated from CR spec at runtime (maps configmap name to deployment names)
-All deployment names in `AffectedDeployments` are explicit (e.g. `lightspeed-app-server`, `lightspeed-rhokp`).
+All deployment names in `AffectedDeployments` are explicit (e.g. `lightspeed-app-server`, `lightspeed-rhokp`). MCP CA mappings union shared consumers, ignore disabled MCP-only stale annotations, and use distinct `mcp-ca` / `mcp-header-*` source tags so no CA-only reference becomes an app-server header mount. See [snapshot generation](config-generation.md#toolset-ca-reference-generation).
 
 When the service-ca operator rotates or populates a watched TLS secret, `SecretUpdateHandler` restarts the mapped deployment via `RestartConsoleUI()` or `RestartAgenticConsoleUI()` (registered in `watchers/watchers.go`).
 
@@ -166,7 +170,7 @@ The OLSConfig CR uses finalizer `ols.openshift.io/finalizer` (defined in `utils.
 1. Remove chat console UI (deactivate plugin, delete ConsolePlugin CR)
 2. Remove agentic console UI (deactivate plugin, delete ConsolePlugin CR)
 3. Remove alerts adapter operand resources (`alertsadapter.RemoveAlertsAdapter()`: deployment, namespaced RBAC, SA, NetworkPolicy, monitoring RoleBinding; AgenticRun ClusterRole/ClusterRoleBinding when the platform permits delete)
-4. Remove OpenShift MCP server operand (`ocpmcp.Remove()`: Deployment, Service, NetworkPolicy, TOML and legacy CA ConfigMaps, ServiceAccount, TLS Secret, ServiceMonitor), then remove RHOKP
+4. Remove OpenShift MCP server operand (`ocpmcp.Remove()`: Deployment, Service, NetworkPolicy, TOML/trust and legacy CA ConfigMaps, ServiceAccount, TLS Secret, ServiceMonitor; currently referenced user CAs protected; runtime/trust/legacy ConfigMap deletion OLSConfig-ownership-guarded even after ref removal; serving TLS Secret ownership checked via OLSConfig or originating OLSConfig-owned Service's matching name/UID before Service deletion), then remove RHOKP
 5. List all owned resources via owner references
 6. Explicitly delete owned resources
 7. Wait up to 3 minutes for deletion (poll every 5 seconds)
@@ -189,6 +193,8 @@ The OLSConfig CR uses finalizer `ols.openshift.io/finalizer` (defined in `utils.
 ### Unit Tests
 
 Unit tests are co-located with source files (`*_test.go`). They use envtest (a local Kubernetes API server) with Ginkgo v2/Gomega. `make test` is required instead of `go test` because the Makefile handles envtest binary download, CRD installation, and build flags.
+
+OLS-2715 typed API/TOML/security and CA snapshot/lifecycle tests pass in the full `make test` suite with default Kubernetes 1.27.1 envtest. Separate [local pinned-image runtime verification](../what/ocpmcp.md#runtime-verification) now passes actual `GenerateConfigTOML` default/empty/seven inputs (22/0/39 tools, mock-discovery-dependent), table/security invariants, static Prometheus/Loki/Tempo HTTPS/custom trust and all six negative CA/hostname cases. First-harness scoped shared service/custom and REST CAData-only metric roots, Alertmanager service root, singular OSSM/NetObserv CA, restart-based rotation/removal and six resource get/list denials with allowed Pod list positive also passed. Both auth modes use caller token when present via derived REST config; missing-header header mode sends anonymous requests and kubeconfig mode uses the supplied synthetic kubeconfig token, not operator identity or real authentication/RBAC proof. Image label `1.0.0` is provenance only (`--version` blank, `serverInfo.version` empty). Separate [full-manager live cluster verification](../what/ocpmcp.md#full-manager-live-cluster-verification) passed 93/93 unique assertions and 30/30 Strict server dry-run checks on CRC OCP 4.22.14 / Kubernetes 1.35.6 using actual production `bin/manager`, not a scoped harness. Full `SetupWithManager` CA watches/public projection/checksums, real Service CA injection, content/reference-identity PodUID rolls, invalid-source retention/recovery, twice disable after ready-condition erasure, bounded real Kubernetes caller RBAC and namespace HTTPS mock metric trust/removal/rotation passed. Five deployed operands reached Ready in local-dev mode (operator ServiceMonitor/metrics reader skipped), not production-deployment proof. Normal finalizer cleanup preserved user CAs/restored console plugins; main subsequently stopped the manager and removed all test-created cluster resources with explicit approval. [PLANNED: OLS-2715] Live authenticated Prometheus/Loki/Tempo backend auth/RBAC, Route endpoint discovery/real stacks, other tool/provider/prompt/diagnostic helper image/kernel/RBAC/SCC prerequisites and external public-root HTTPS remain unverified. Local synthetic logs/traces/auth evidence is separate; no hot-reload, atomic rollout or all-tool/shipping-complete claim. See live observations for recovered mount/order transients and extra metadata-RV recovery rolls; no source fixes were made.
 
 ### E2E Tests
 

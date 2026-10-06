@@ -244,6 +244,228 @@ Field | JSON key | Go type | Required
 
 31. `spec.ols.mcpKubeServerConfig.timeout` -- `int`. Default: `60`. Minimum=5. App-server client timeout in seconds for the built-in MCP Kubernetes server; not a server-runtime setting.
 
+##### Typed Toolset Selection
+
+`spec.ols.mcpKubeServerConfig.toolsets` is an optional array of typed single-toolset objects. It is a **replacement selection**, not an additive list.
+
+| Input | Effective selection |
+|---|---|
+| `toolsets` absent, including absent `mcpKubeServerConfig` | Existing operator defaults: `core`, `config`, `helm`, `observability/metrics`, `kubevirt` |
+| Nonempty `toolsets` | Exactly the named entries; do not add defaults or implicit dependencies |
+| `toolsets: []` | No toolsets; do not fall back to defaults |
+
+Example selection and CA-reference shape:
+
+```yaml
+spec:
+  ols:
+    mcpKubeServerConfig:
+      toolsets:
+        - ossm:
+            url: https://kiali.example.com
+            caBundleRef:
+              configMap:
+                name: kiali-ca
+                key: ca.crt
+        - netobserv:
+            namespace: netobserv
+            service: netobserv-plugin
+            port: 9001
+        - core: {}
+        - tekton: {}
+```
+
+- MaxItems=17. Each entry contains exactly one recognized toolset key with an object value (MinProperties=1, MaxProperties=1 and CEL singleton validation); CEL also rejects duplicate toolsets. Empty or unknown-only entries are rejected after pruning. Requests must use `fieldValidation=Strict` to reject unknown typed configuration fields (including `insecure`) or mixed recognized/unknown selection keys: otherwise Kubernetes prunes unknown fields before CEL can inspect them. The ten empty-only blocks are maps with MaxProperties=0, so populated blocks are rejected even without Strict. The [versioned inventory](../how/config-generation.md#ocp-mcp-toolset-inventory--ols-2715-design-input) contains 18 compiled toolsets; the 17 other than `openshift/mustgather` are in scope. Reject `openshift/mustgather` selection with a clear unsupported-toolset error; do not expose its configuration or an archive/PVC API in OLS-2715.
+- A configuration-free toolset is selected as `<name>: {}`. For configurable toolsets, `{}` is allowed only when that toolset's validation contract permits omission of all settings; it must not bypass required configuration.
+- Settings are typed per toolset and colocated with selection. There is no separate `additionalToolsets` field or freeform TOML passthrough. CR key `ossm` maps to server selection `ossm` and configuration table `kiali`.
+- Preserve absent versus explicitly empty arrays through API decoding, serialization, deepcopy and reconciliation. Do not admission-default this field to the operator list or use a length-zero check to choose defaults.
+- `introspectionEnabled` remains the operand gate. Empty selection does not remove the Deployment, Service or client/handoff wiring. Selection does not grant permissions, override security/compatibility filters, or install dependencies.
+- Endpoint URLs have MaxLength=2048, require absolute HTTPS with a host and no userinfo. NetObserv namespace/Service fields have MaxLength=63 and DNS-label patterns (Service starts with a letter). Helm allowlists have MaxItems=64, each URL MaxLength=2048, HTTPS/OCI with a host and no userinfo.
+- Typed supported-toolset fields/defaults, structural schema/CEL validation and shared CA generation are implemented below. Local pinned-image execution with actual `GenerateConfigTOML` output passed default/empty/seven-block startup and static Prometheus/Loki/Tempo HTTPS scenarios; separate full-manager live cluster tests also passed default/empty/core replacement selection and Strict server dry-run validation. [Runtime verification](ocpmcp.md#runtime-verification) distinguishes these passed scopes from remaining [PLANNED: OLS-2715] authenticated backend/Route/tool-functionality proofs. No additional security-policy surface is introduced.
+
+##### Toolset CA Bundle Reference
+
+The OSSM and NetObserv typed blocks use `caBundleRef` for explicit backend trust. It is a keyed, local ConfigMap-or-Secret reference, not a filesystem path. It is required for OSSM and NetObserv's explicit-URL form; NetObserv's service form may omit it to use operator-provisioned cluster service-CA trust, as specified below. The reference does not automatically add trust settings to other toolsets whose server implementations lack a corresponding field.
+
+```yaml
+caBundleRef:
+  configMap:
+    name: kiali-ca
+    key: ca.crt
+```
+
+Alternatively:
+
+```yaml
+caBundleRef:
+  secret:
+    name: kiali-ca
+    key: ca.crt
+```
+
+| Field | Shape | Validation |
+|---|---|---|
+| `configMap` | Optional object with `name`, `key` | Exactly one of `configMap` / `secret` |
+| `secret` | Optional object with `name`, `key` | Exactly one of `configMap` / `secret` |
+| Selected source `name` | Required string | DNS subdomain pattern; MinLength=1, MaxLength=253 |
+| Selected source `key` | Required string | Pattern `^[-._a-zA-Z0-9]+$`; MinLength=1, MaxLength=253; no key default |
+
+- No `namespace`, `optional`, arbitrary path, or generic volume-source fields. Resolve sources in the operand namespace, even though OLSConfig is cluster-scoped.
+- Admission validates the discriminated reference shape and names/keys. Reconciliation validates object existence, selected-key existence and a valid certificate bundle; failures produce a clear error rather than silently falling back to insecure TLS.
+- Selected keys must contain only nonempty, valid X.509 certificate PEM. Reconciliation canonicalizes and copies only public certificate PEM into operator-owned `openshift-mcp-server-trust`; MCP projects selected snapshot keys read-only, never live user sources. Valid content or reference-identity changes roll MCP; invalid changes retain the last validated snapshot and do not roll it. Sources remain user-owned and are never deleted on selection changes, disable or finalization.
+- CA references cannot select reserved MCP ConfigMaps `openshift-mcp-server-config`, `openshift-mcp-server-trust`, `openshift-mcp-server-ca`, or serving Secret `openshift-mcp-server-tls`. Enabled reconciliation rejects these references; cleanup still protects referenced sources. Colliding unowned runtime/trust/legacy ConfigMaps are not adopted, overwritten or deleted, even after CA reference removal; deletion requires OLSConfig ownership. Serving TLS Secret cleanup requires OLSConfig ownership or a v1 Service owner reference matching the originating OLSConfig-owned Service name/UID, checked before Service deletion; unowned outputs remain protected.
+- See [TLS contract](tls.md#mcp-toolset-backend-ca-bundles) and [generation/lifecycle](../how/config-generation.md#toolset-ca-reference-generation).
+
+##### Shared MCP CA Bundles
+
+`spec.ols.mcpKubeServerConfig.caBundleRefs` is an optional array of the same typed ConfigMap-or-Secret name/key references used by `caBundleRef`. It augments baseline trust; it does not replace the baseline or select/enable toolsets.
+
+```yaml
+spec:
+  ols:
+    mcpKubeServerConfig:
+      caBundleRefs:
+        - configMap:
+            name: observability-ca
+            key: ca.crt
+        - secret:
+            name: private-backend-ca
+            key: ca.crt
+      toolsets:
+        - observability/logs: {}
+```
+
+- Baseline trust preserves image/system roots and adds the validated cluster service CA. Omitted `caBundleRefs` or `[]` means no user-provided bundles; baseline trust remains. Unlike `toolsets`, this list has augmenting, not replacement, semantics.
+- MaxItems=64. Each entry has exactly one `configMap` or `secret`, required explicit name/key, local operand-namespace resolution and no optional-missing flag/path. Admission validates shape; reconciliation validates sources, selected keys and certificate bundles.
+- User bundles are shared MCP-process trust for clients using system roots, not endpoint-isolated trust and not a claim that every toolset consumes system roots. This can affect other system-root consumers, including clients beyond observability; document that scope rather than imply per-toolset isolation.
+- OSSM/NetObserv singular `caBundleRef` remains their explicit client setting and is not replaced by this list. Shared roots may also affect clients that append to system roots; clients that replace their roots can behave differently, as recorded in the source inventory.
+- Sources stay user-owned. Validate changes and roll MCP on valid bundle changes; removing an entry removes its user-provided contribution without deleting its source or baseline roots. Missing sources/keys or invalid bundles are clear reconciliation errors, never a reason to disable TLS verification.
+- Trust configuration is independent of selection. `toolsets: []` retains the MCP operand and baseline trust; `introspectionEnabled=false` still disables the operand, without deleting referenced bundles. References are consumed by the managed MCP workload when that operand is enabled.
+- The implemented snapshot mounts shared roots at `/etc/mcp-server/ca`, sets `SSL_CERT_DIR=/etc/ssl/certs:/etc/pki/tls/certs:/etc/mcp-server/ca`, and leaves `SSL_CERT_FILE` unset, preserving default image certificate files. Local pinned-image static Prometheus/Loki/Tempo HTTPS/custom trust and unknown-CA/hostname rejection passed. First-harness metrics verify shared synthetic service roots, populated/CAData-only REST roots and restart-based root rotation/removal; these are not live Service CA injection or hot reload. Inspection confirms 146 image bundle certificates retained. Separate full production `bin/manager` live tests verify public projection/checksums/private-key nonprojection, source events, content/reference-identity PodUID rollouts, invalid-input retention/recovery and real Service CA injection. Namespace Python HTTPS metric value 2715 succeeds with custom shared roots; removal/rotation fails TLS before extra HTTP, updated roots roll MCP, and real Service CA-only baseline succeeds. External public-root HTTPS remains [PLANNED: OLS-2715]; neither local restart tests nor live controller rolls establish hot reload or production deployment. See [runtime matrix](ocpmcp.md#verification-matrix). See [TLS contract](tls.md#shared-mcp-process-trust) and [generation](../how/config-generation.md#shared-mcp-trust-generation).
+
+##### OSSM Configuration
+
+| Field under `toolsets[].ossm` | Type | Required / default | Validation |
+|---|---|---|---|
+| `url` | string | Required; no discovery/default | Valid absolute HTTPS endpoint with nonempty host; reject HTTP/non-HTTPS schemes |
+| `caBundleRef` | Typed CA reference | Required | Shared ConfigMap-or-Secret reference contract above |
+
+`ossm: {}` is invalid. Do not expose `insecure`, arbitrary certificate paths or separate credentials. The operator generates verified HTTPS settings and maps this CR block to `toolset_configs.kiali`; authentication uses the server's derived caller credentials. Per-toolset selection does not change global authentication policy.
+
+##### NetObserv Configuration
+
+NetObserv has mutually exclusive explicit-URL and service-based endpoint forms.
+
+| Field under `toolsets[].netobserv` | Type | Required / effective default | Validation |
+|---|---|---|---|
+| `url` | Optional string | If present, selects explicit-URL form | Valid absolute HTTPS endpoint with nonempty host; reject HTTP/non-HTTPS schemes |
+| `namespace` | Optional string | Service form: `netobserv` | Valid nonempty Kubernetes namespace name; forbidden with `url` |
+| `service` | Optional string | Service form: `netobserv-plugin` | Valid nonempty Kubernetes Service name; forbidden with `url` |
+| `port` | Optional integer | Service form: `9001` | 1–65535 when supplied; forbidden with `url` |
+| `caBundleRef` | Optional typed CA reference | Required with `url`; service form defaults to cluster service CA if omitted | Shared reference contract; allowed in either form |
+
+- With `url`, reject explicitly supplied `namespace`, `service` or `port`, even if their values equal service defaults. Never silently ignore conflicting settings. Do not use unconditional CRD defaults on these fields: compute service defaults only after choosing the form, preserving field presence for validation.
+- Without `url`, generate `https://<service>.<namespace>.svc.cluster.local:<port>` using supplied values or service defaults. `netobserv: {}` is valid and means the default service endpoint with operator-provisioned cluster service-CA trust.
+- In service form, an explicit `caBundleRef` overrides the implicit cluster service-CA source. Otherwise validate and mount `openshift-service-ca.crt` / `service-ca.crt` from the operand namespace. Missing/invalid trust is a reconciliation error; no insecure or system-trust fallback for that error.
+- Do not expose `insecure`, arbitrary certificate paths or separate credentials. Always generate `insecure = false` and an explicit CA path; do not rely on upstream OpenShift detection or opportunistic CA-file discovery.
+- Backend namespace identifies the destination Service, not the namespace of a CA reference. CA references remain local to the operand namespace. Selection does not install or grant access to NetObserv.
+
+##### Helm Configuration
+
+| Field under `toolsets[].helm` | Type | Required / effective default | Validation |
+|---|---|---|---|
+| `storageDriver` | Optional string | `configmap` for explicit Helm selection | Only `configmap` supported; reject `secret` while OLS Secret denial is mandatory |
+| `allowedRegistries` | Optional string array | Empty: no registry allowlist | Each entry must have scheme/host; HTTPS or OCI only; enforce upstream normalized URL/path-prefix allowlist semantics |
+
+`helm: {}` is valid and generates ConfigMap-backed release storage. This is a default for the new explicit selection path, not a change to omitted `toolsets`: omission retains today's generated config, including no Helm table and the image's Secret-backed storage default. ConfigMap storage does not grant access or change denied-resource rules. Registry credentials/CA/local chart mounts are not added by these fields; any additional integration needs remain separate design work.
+
+##### Observability Metrics Configuration
+
+| Field under `toolsets[].observability/metrics` | Type | Required / effective default | Validation |
+|---|---|---|---|
+| `prometheusURL` | Optional string | OLS in-cluster Thanos URL when absent | Valid absolute HTTPS endpoint with nonempty host; reject HTTP/non-HTTPS schemes |
+| `alertmanagerURL` | Optional string | OLS in-cluster Alertmanager URL when absent | Valid absolute HTTPS endpoint with nonempty host; reject HTTP/non-HTTPS schemes |
+| `authMode` | Optional string | `header` | Enum `header`, `kubeconfig`; no independent credential fields |
+| `guardrails` | Optional string | `!tsdb` when `prometheusURL` absent; `all` with an explicit Prometheus URL | MaxLength=512; validate the complete upstream grammar in the [inventory](../how/config-generation.md#metrics); explicit value overrides the conditional default |
+| `maxMetricCardinality` | Optional integer | Server's `20000` when relevant and absent | Positive; explicit limit requires effective `max-metric-cardinality` guardrail |
+| `maxLabelCardinality` | Optional integer | Server's `500` when relevant and absent | Nonnegative; explicit limit requires effective `disallow-blanket-regex` guardrail; zero means always reject blanket regex |
+| `rangeQueryFullResponse` | Optional boolean | `false` | Explicit false and true supported |
+
+- `observability/metrics: {}` preserves the useful OLS endpoint/guardrail configuration: `https://thanos-querier.openshift-monitoring.svc.cluster.local:9091`, `https://alertmanager-main.openshift-monitoring.svc.cluster.local:9094`, `!tsdb`. It does not fall back to upstream localhost.
+- Default each endpoint independently when absent. Supplying only `alertmanagerURL` does not change the Prometheus guardrail default. An explicit `prometheusURL` chooses `all` unless `guardrails` is supplied; this is a presence-based rule, not URL-string equivalence or backend detection.
+- Validate cardinality settings against the effective guardrails, including conditional defaults. For example, an explicit `maxMetricCardinality` with default `!tsdb` is invalid because its guardrail is disabled. Do not inject cardinality fields when absent merely to materialize inactive defaults; preserve explicit zero for the label limit.
+- Do not unconditionally admission-default `guardrails`: its default depends on Prometheus URL presence. Preserve presence through API round trips and compute defaults in generation/validation.
+- `header` and `kubeconfig` select upstream handler-context versus derived REST credentials, not operator privileges. Actual metric/log/trace calls in **both** modes use caller token when a bearer header exists because `Manager.Derived` replaces REST BearerToken. Without that header, `header` sends an anonymous backend request; `kubeconfig` uses the supplied synthetic kubeconfig token. These upstream wrinkles do not establish static identity isolation, mandatory/global authentication or real backend/Kubernetes RBAC; permissive mocks accept anything, with no TokenReview/SubjectAccessReview. See [auth observations](ocpmcp.md#authentication-observations); no code/security-policy expansion is implied.
+- Metrics endpoints support verified HTTPS only. No `insecure` option is exposed; generate `insecure = false` for explicit metrics selections and reject insecure configuration rather than bypassing verification. Custom backend trust uses shared `mcpKubeServerConfig.caBundleRefs`, not a nonexistent vendor per-toolset CA field. The shared system-trust mechanism passed actual local pinned-image Prometheus HTTPS calls and separate full-manager live namespace HTTPS metric trust/removal/rotation/real Service CA-baseline checks, not public-root endpoint or authenticated production-backend auth/RBAC proof; OSSM/NetObserv-specific CA mapping is not a substitute.
+
+##### Observability Logs and Traces Endpoint Configuration
+
+| Block | Static endpoint field | Static endpoint contract | Discovery when endpoint absent |
+|---|---|---|---|
+| `observability/logs` | Optional `lokiURL` string | Valid absolute HTTPS endpoint with nonempty host | LokiStack/Route discovery using invocation instance selectors |
+| `observability/traces` | Optional `tempoURL` string | Valid absolute HTTPS API base with nonempty host | Tempo instance/Route discovery using invocation instance selectors |
+
+Both blocks expose optional string `authMode`, default `header`, enum `header` / `kubeconfig`. Reject explicit empty/unknown values; no independent token, username/password or credential-reference fields. Header mode uses handler-context credentials; kubeconfig mode uses the derived Kubernetes REST credentials, not an automatic grant of the operator's identity. This matches metrics, including the observed caller-token-in-both-modes and anonymous-header-without-token wrinkles above; it does not change global authentication or caller authorization policy.
+
+Both blocks expose optional `useRoute` only for discovery, with effective value `true`. Reject `false`: service-DNS discovery can generate HTTP in this server version, so accepting it would violate the HTTPS-only contract. Reject a static endpoint combined with explicitly supplied `useRoute`, even `true`, instead of silently ignoring the setting. Do not unconditionally admission-default `useRoute`, which would create that conflict for static endpoints. Runtime generation emits `use_route = true` for discovery.
+
+```yaml
+toolsets:
+  - observability/logs: {}
+  - observability/traces:
+      tempoURL: https://tempo.example.com/api/traces/v1/application/tempo
+```
+
+- Empty blocks select route-based discovery, not a hardcoded instance. Namespace/name/tenant and query selectors remain tool invocation arguments, not new CR settings. Static Tempo URLs must include the intended API base; upstream does not complete a tenant path from the invocation argument in that form.
+- No `insecure` option. Generate verified TLS and reject HTTP/static non-HTTPS schemes. Do not rewrite discovered HTTP URLs to HTTPS or silently fall back to Service endpoints when Route discovery fails.
+- Endpoint selection does not establish trust, Route availability or authorization. These vendor clients lack per-toolset CA-file settings; use shared MCP `caBundleRefs` to augment process trust. The OSSM/NetObserv `caBundleRef` mapping cannot simply be reused as a vendor TOML field.
+- Existing compatibility filtering remains independent: logs needs LokiStack API, traces needs TempoStack API even for static endpoints or Monolithic-only installations in this pin. Discovery can additionally require both Tempo resource kinds. Document/test these limits; no implicit disabling of global filters.
+- Actual serializer-generated static Loki/Tempo HTTPS calls passed with shared custom trust, functional synthetic log/trace outputs and both auth-mode sourcing classifications; unknown CA and wrong hostname both fail before HTTP. Mock LokiStack/TempoStack discovery enables tools, but real Route endpoint discovery/stacks, live authenticated Prometheus/Loki/Tempo backend auth/RBAC (including negative authorization) and external public-root HTTPS remain [PLANNED: OLS-2715]. Bounded real Kubernetes caller RBAC passed separately, not live logs/traces backend authorization. See [runtime verification](ocpmcp.md#runtime-verification).
+
+##### CNI Diagnostics Configuration
+
+| Field under `toolsets[].cni-diagnostics` | Type | Effective default | Validation |
+|---|---|---|---|
+| `kernelDebugImage` | Optional string | `nicolaka/netshoot:v0.16` | Nonempty syntactically valid container image reference when supplied |
+| `tcpdumpImage` | Optional string | `nicolaka/netshoot:v0.16` | Nonempty syntactically valid container image reference when supplied |
+| `pwruImage` | Optional string | `docker.io/cilium/pwru:v1.0.10` | Nonempty syntactically valid container image reference when supplied |
+
+- Each supplied image has MaxLength=512 and a bounded reference pattern accepting conventional repositories, optional registry/port, tag and SHA-256 digest; exotic registry authorities and non-SHA-256 digests are unsupported.
+- `cni-diagnostics: {}` is valid and uses the pinned upstream defaults. Explicit empty/invalid image strings are rejected rather than silently replaced. Defaults apply only to an explicitly selected CNI block; omission of `toolsets` does not add CNI.
+- Overrides permit mirrored/custom images for disconnected deployments. Syntax validation does not prove image availability, pull permission, executable compatibility or kernel/eBPF capability. The operator does not build, mirror or install these helper images under this contract.
+- These are images for diagnostic workloads, not an override of the MCP server image. Node diagnostics can create privileged host-access pods using caller permissions; selecting CNI does not grant RBAC/SCC or change the MCP Deployment's restricted security context.
+- Pod-target tcpdump execs into an existing container: its image field does not install the capture binary there. Packet/host output is not sanitized by Kubernetes Secret/RBAC denied-resource rules. Source annotations let these tools survive destructive filtering even though execution uses privileged/exec machinery; the agreed policy keeps `read_only=false`, `disable_destructive=true`, existing resource denial and compatibility filters, without new privilege grants or per-toolset security controls.
+
+##### Configuration-free Toolsets
+
+These ten selections accept only an empty object and expose no configuration fields:
+
+| Selection key | Relevant pinned-runtime limitation |
+|---|---|
+| `core` | Destructive-annotated writes remain filtered; operation-specific APIs and caller permissions apply |
+| `config` | Normally no tools in single-target OLS: target-list tools are filtered and `configuration_view` remains disabled |
+| `kcp` | Selection does not configure a kcp provider or supply workspace endpoints; useful operation requires an appropriate target |
+| `kubevirt` | Requires virtualization APIs/workloads; several mutating tools remain filtered, while prompts have separate availability |
+| `tekton` | Requires Tekton APIs/definitions; destructive PipelineRun lifecycle remains filtered |
+| `cluster-diagnostics` | Sole `nodes_debug_exec` tool is destructive and currently filtered, leaving zero tools/prompts |
+| `netedge` | Existing workloads, discovery, image access and caller permissions apply; monitoring uses a separate auth/TLS client |
+| `oadp` | Prompt-only in this pin; selecting it does not establish that the consuming OLS client invokes prompts |
+| `ovn-kubernetes` | Existing OVN/OVS workloads, expected containers/binaries and caller pod-exec permissions required |
+| `observability/otelcol` | Embedded schemas need no user settings; current compatibility predicate requires Collector CRD even for local schema tools |
+
+Example:
+
+```yaml
+toolsets:
+  - core: {}
+  - cluster-diagnostics: {}
+  - observability/otelcol: {}
+```
+
+- All these selections are valid even if filters/prerequisites leave no usable tools. Do not reject a valid selection for absent installation, prompt-consumption limitations or zero exposed tools; do not install dependencies, add implicit selections or relax filters. These are documented runtime wrinkles, not OLS-2715 admission blockers.
+- No arbitrary nested fields or global/provider settings belong in these blocks. Generate selection only, without unregistered TOML config tables; Collector schemas use the server's embedded defaults rather than exposing `SchemaFS`.
+- Keep `read_only=false` and `disable_destructive=true` for every selection form, including omitted/default and explicit-empty selection. No new security-policy controls are introduced. Existing denied resources, compatibility filtering, disabled tools, restricted MCP pod context and caller authorization remain in force.
+
 #### Proxy Configuration (spec.ols.proxyConfig)
 
 32. `spec.ols.proxyConfig.proxyURL` -- `string`, optional. Pattern: `^https?://.*$`. If unset, cluster-wide proxy is used via `https_proxy` env var.
@@ -506,6 +728,8 @@ Path | Type | Default | Required | Validation | Description
 `spec.ols.auditEventsEnabled` | `*bool` | `true` | No | -- | Stdout compliance audit JSON events
 `spec.ols.mcpKubeServerConfig` | `*MCPKubeServerConfiguration` | -- | No | -- | Built-in MCP kube server config
 `spec.ols.mcpKubeServerConfig.timeout` | `int` | `60` | No | Min=5 | Timeout (seconds)
+`spec.ols.mcpKubeServerConfig.toolsets` | `*[]MCPToolsetSelection` | Runtime operator defaults only when absent | No | MaxItems=17; singleton recognized key; unique toolsets; typed validation; unknown-field pruning caveat above | Full replacement selection; empty means none
+`spec.ols.mcpKubeServerConfig.caBundleRefs` | `[]MCPCAReference` | No user bundles | No | MaxItems=64; exactly one source; explicit local name/key | Augments shared MCP system/cluster baseline trust; empty does not remove baseline
 `spec.ols.proxyConfig` | `*ProxyConfig` | -- | No | -- | Proxy settings
 `spec.ols.proxyConfig.proxyURL` | `string` | -- | No | Pattern `^https?://.*$` | Proxy URL
 `spec.ols.proxyConfig.proxyCACertificate` | `*ProxyCACertConfigMapRef` | -- | No | -- | Proxy CA cert ref
@@ -582,10 +806,17 @@ Path | Type | Default | Required | Validation | Description
 
 ## Verification
 
+- OLS-2715 implemented verification: the full `make test` suite passes with default Kubernetes 1.27.1 envtest. Operator tests cover absent/empty/replacement selection and round trips/deepcopy; all 17 selections, singleton/duplicate/requiredness validation; Strict unknown-field rejection and non-Strict empty-map rejection; typed endpoint, registry, guardrail/cardinality, auth-mode and image validation; generated TOML defaults/mappings and retained security policy.
+- CA/lifecycle tests cover both source kinds, missing/invalid keys and certificate-only PEM, canonical public snapshots, read-only key projections, content/reference-identity rollouts, invalid-update retention, Phase 2 snapshot matching, rotation/removal/recovery, baseline tracking independent of NetObserv, shared consumers, stale annotations, reserved references, ownership collisions, protected user sources and idempotent disable cleanup without readiness history.
+- Actual pinned-image runtime evidence: `GenerateConfigTOML` inputs `null`, `{"toolsets":[]}` and seven typed selections passed startup/tools/list with 22, 0 and 39 tools (mock-discovery-dependent, not universal). Generated tables/security invariants remain intact. Actual static Prometheus/Loki/Tempo HTTPS/custom trust and all six negative CA/hostname calls passed; auth sourcing verified both upstream wrinkles, not backend authorization. First harness separately verifies singular OSSM/NetObserv trust, shared service/custom and REST CAData-only metric roots, Alertmanager shared service root, restart-based root rotation/removal and six Secret/Role/ClusterRole get/list denials (zero API requests) with allowed Pod list positive. See [runtime matrix](ocpmcp.md#verification-matrix) and its provenance/version caveats.
+- Full-manager live cluster evidence: **93/93 unique assertions; 30/30 Strict server dry-run checks** on CRC OCP 4.22.14 / Kubernetes 1.35.6 with actual production `bin/manager` and full `SetupWithManager` watches, not a scoped harness. Admission comprises 25 configuration-specific invalid rejections and five valid-config controls rejected **only** for the separate wrong singleton name, not successful admission/create. Live default/empty/core replacement, real Service CA injection, public selected-key projection/checksums/private-key nonprojection, CA update/create/delete/binaryData/recovery, reference-identity rolls and invalid-source snapshot/pod retention passed. Twice disable after invalid-source status erased readiness history cleaned MCP while preserving user CAs; fix/re-enable restored Ready. Actual namespace Python HTTPS metric 2715 custom-root removal/rotation and Service CA-only baseline passed. Caller Pod access succeeds without operand-SA read RBAC; Secret/Role/RoleBinding policy denials differ from allowed ConfigMap caller-RBAC forbidden. No live audit proof of zero upstream API requests. All five deployed operands reached Ready in local-dev mode (operator ServiceMonitor/metrics reader skipped), not production-deployment proof. Normal finalization preserved user CAs/restored console; subsequent explicitly approved main cleanup removed all test-created cluster resources. See [live matrix, transients and cleanup](ocpmcp.md#full-manager-live-cluster-verification).
+- [PLANNED: OLS-2715] Remaining external public-root endpoint HTTPS; live authenticated Prometheus/Loki/Tempo backend auth/RBAC and negative authorization; Route-based endpoint discovery/real stacks; all-tool functionality, compatibility/prompt/provider limitations and diagnostic helper image/command/kernel/RBAC/SCC prerequisites. Earlier local synthetic logs/traces/auth success and preserved root files do not establish these proofs; restricted-v2/non-root MCP readiness did not exercise CNI/helper functionality. Recovered mount/order and metadata-RV recovery-roll wrinkles were documented, not source-fixed.
 - [OLS-4290] Tests cover `terminalTTL` validation, absent-field semantics, and publication/removal of `terminal-ttl-days` in the handoff ConfigMap.
 - [PLANNED: OLS-3928] Operator tests cover explicit values, the default value, generated Classic configuration, and the `tool-output-inspection-enabled` handoff key.
 
 ## Planned Changes
+
+- [PLANNED: OLS-2715] Complete remaining live authenticated Prometheus/Loki/Tempo backend auth/RBAC, Route discovery/real stacks, all-tool/helper-prerequisite and external public-root HTTPS proofs listed in Verification above. Full-manager live CA/controller/lifecycle and bounded Kubernetes caller-RBAC checks passed; earlier local actual pinned-image synthetic logs/traces/auth-sourcing evidence remains separate; see [ocpmcp.md](ocpmcp.md#runtime-verification).
 
 - [OLS-3450] Added `spec.ols.credentialHotReload` boolean field. When enabled, the operator skips annotating LLM credential secrets (no restart on rotation) and writes `credential_hot_reload: true` into `olsconfig.yaml`. See design spec `docs/superpowers/specs/2026-09-01-credential-hot-reload-design.md`.
 -  Added `reasoningConfig` field (`map[string]runtime.RawExtension`) to `ModelParametersSpec`. Freeform map passed through to the service as `reasoning_config` for provider-specific reasoning/thinking parameters. Includes release notes and user-facing documentation for valid keys per provider.

@@ -1,9 +1,10 @@
 package ocpmcp
 
 import (
-	"fmt"
 	"path"
-	"strings"
+	"strconv"
+
+	"github.com/BurntSushi/toml"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,22 +34,25 @@ var _ = Describe("OpenShift MCP Server assets", func() {
 		Expect(cm.Namespace).To(Equal(utils.OLSNamespaceDefault))
 		Expect(cm.Labels).To(Equal(labels))
 
-		toml := cm.Data[utils.OpenShiftMCPServerConfigFilename]
-		Expect(toml).To(ContainSubstring(fmt.Sprintf(`port = "%d"`, utils.OpenShiftMCPServerHTTPSPort)))
-		Expect(toml).To(ContainSubstring(fmt.Sprintf(`tls_cert = "%s"`, path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.crt"))))
-		Expect(toml).To(ContainSubstring(fmt.Sprintf(`tls_key = "%s"`, path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.key"))))
-		Expect(toml).To(ContainSubstring("read_only = false"))
-		Expect(toml).To(ContainSubstring(`toolsets = ["core", "config", "helm", "observability/metrics", "kubevirt"]`))
-		Expect(toml).To(ContainSubstring(`experimental_enable_target_compatibility_tool_filters = true`))
-		Expect(toml).To(ContainSubstring(`kind = "Secret"`))
-		Expect(toml).To(ContainSubstring(`group = ""`))
-		Expect(toml).To(ContainSubstring(`group = "rbac.authorization.k8s.io"`))
-		Expect(toml).To(ContainSubstring("[[denied_resources]]"))
-		Expect(toml).To(ContainSubstring(`[toolset_configs."observability/metrics"]`))
-		Expect(toml).To(ContainSubstring(`prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"`))
-		Expect(toml).To(ContainSubstring(`alertmanager_url = "https://alertmanager-main.openshift-monitoring.svc.cluster.local:9094"`))
-		Expect(toml).To(ContainSubstring(`guardrails = "!tsdb"`))
-		Expect(strings.Count(toml, "[[denied_resources]]")).To(Equal(2))
+		var config mcpRuntimeConfig
+		_, err = toml.Decode(cm.Data[utils.OpenShiftMCPServerConfigFilename], &config)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(config.Port).To(Equal(strconv.Itoa(int(utils.OpenShiftMCPServerHTTPSPort))))
+		Expect(config.TLSCert).To(Equal(path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.crt")))
+		Expect(config.TLSKey).To(Equal(path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.key")))
+		Expect(config.ReadOnly).To(BeFalse())
+		Expect(config.DisableDestructive).To(BeTrue())
+		Expect(config.Toolsets).To(Equal([]string{"core", "config", "helm", "observability/metrics", "kubevirt"}))
+		Expect(config.CompatibilityFilters).To(BeTrue())
+		Expect(config.DeniedResources).To(Equal([]mcpDeniedResource{
+			{Group: "", Version: "v1", Kind: "Secret"},
+			{Group: "rbac.authorization.k8s.io", Version: "v1"},
+		}))
+		Expect(config.ToolsetConfigs["observability/metrics"]).To(Equal(map[string]any{
+			"prometheus_url":   "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091",
+			"alertmanager_url": "https://alertmanager-main.openshift-monitoring.svc.cluster.local:9094",
+			"guardrails":       "!tsdb",
+		}))
 	})
 
 	It("should generate the Service with HTTPS port and serving-cert annotation", func() {

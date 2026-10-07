@@ -241,6 +241,8 @@ const (
 	ErrGetOpenShiftMCPServerDeployment                   = "failed to get openshift-mcp-server deployment"
 	ErrUpdateOpenShiftMCPServerDeployment                = "failed to update openshift-mcp-server deployment"
 	ErrGetOpenShiftMCPServerTLSSecret                    = "failed to get openshift-mcp-server TLS secret" // #nosec G101
+	ErrGenerateOpenShiftMCPServerTrust                   = "failed to generate openshift-mcp-server CA trust"
+	ErrReconcileOpenShiftMCPServerTrust                  = "failed to reconcile openshift-mcp-server CA trust"
 
 	/*** RHOKP Standalone Errors ***/
 	ErrGenerateRHOKPService                 = "failed to generate RHOKP service"

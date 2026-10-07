@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	olsv1alpha1 "github.com/openshift/lightspeed-operator/api/v1alpha1"
@@ -20,6 +21,11 @@ import (
 // ReconcileResources reconciles Phase 1 standalone MCP resources.
 // When introspectionEnabled is false, removes managed MCP resources instead.
 func ReconcileResources(r reconciler.Reconciler, ctx context.Context, olsconfig *olsv1alpha1.OLSConfig) error {
+	// Validate all CA inputs before publishing runtime configuration. Invalid
+	// source updates must not change the last validated snapshot or roll MCP.
+	if err := reconcileTrustConfigMap(r, ctx, olsconfig); err != nil {
+		return err
+	}
 	return utils.RunReconcileTasks(r, ctx, olsconfig, "reconcileOpenShiftMCPServerResources", []utils.ReconcileTask{
 		{Name: "reconcile openshift-mcp-server ConfigMap", Task: reconcileConfigMap},
 		{Name: "reconcile openshift-mcp-server ServiceAccount", Task: reconcileServiceAccount},
@@ -42,11 +48,13 @@ func ReconcileDeployment(r reconciler.Reconciler, ctx context.Context, olsconfig
 func Remove(r reconciler.Reconciler, ctx context.Context) error {
 	return utils.RunDeleteTasks(r, ctx, "RemoveOpenShiftMCPServer", []utils.DeleteTask{
 		{Name: "delete openshift-mcp-server deployment", Task: deleteDeployment},
+		// Check service-ca ownership before deleting the originating Service.
+		{Name: "delete openshift-mcp-server TLS secret", Task: deleteTLSSecret},
 		{Name: "delete openshift-mcp-server service", Task: deleteService},
 		{Name: "delete openshift-mcp-server network policy", Task: deleteNetworkPolicy},
 		{Name: "delete openshift-mcp-server configmap", Task: deleteConfigMap},
+		{Name: "delete openshift-mcp-server trust snapshot", Task: deleteTrustConfigMap},
 		{Name: "delete openshift-mcp-server service account", Task: deleteServiceAccount},
-		{Name: "delete openshift-mcp-server TLS secret", Task: deleteTLSSecret},
 		{Name: "delete openshift-mcp-server ServiceMonitor", Task: deleteServiceMonitor},
 		{Name: "delete legacy openshift-mcp-server CA ConfigMap", Task: deleteLegacyCAConfigMap},
 	})
@@ -70,6 +78,9 @@ func reconcileConfigMap(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 		return fmt.Errorf("%s: %w", utils.ErrGetOpenShiftMCPServerConfigMap, err)
 	}
 
+	if !metav1.IsControlledBy(foundCm, cr) {
+		return fmt.Errorf("%s: refusing to overwrite unowned ConfigMap %s", utils.ErrUpdateOpenShiftMCPServerConfigMap, foundCm.Name)
+	}
 	if utils.ConfigMapEqual(foundCm, cm) && reflect.DeepEqual(foundCm.Labels, cm.Labels) {
 		r.GetLogger().Info("openshift-mcp-server configmap unchanged, reconciliation skipped", "configmap", cm.Name)
 		return nil
@@ -219,12 +230,18 @@ func removeLegacyCAConfigMap(r reconciler.Reconciler, ctx context.Context, _ *ol
 
 func deleteLegacyCAConfigMap(r reconciler.Reconciler, ctx context.Context) error {
 	cm := &corev1.ConfigMap{}
+	if referenced, err := isUserCASource(r, ctx, cm, utils.LegacyOpenShiftMCPServerCAConfigMapName); err != nil || referenced {
+		return err
+	}
 	err := r.Get(ctx, client.ObjectKey{Name: utils.LegacyOpenShiftMCPServerCAConfigMapName, Namespace: r.GetNamespace()}, cm)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to get legacy openshift-mcp-server CA ConfigMap: %w", err)
+	}
+	if err := requireMCPOutputOwnership(r, ctx, cm); err != nil {
+		return err
 	}
 	if err := r.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete legacy openshift-mcp-server CA ConfigMap: %w", err)
@@ -233,13 +250,74 @@ func deleteLegacyCAConfigMap(r reconciler.Reconciler, ctx context.Context) error
 	return nil
 }
 
+// A reserved-name collision is rejected during enabled reconciliation, but
+// cleanup must still never delete a currently referenced user CA source.
+func isUserCASource(r reconciler.Reconciler, ctx context.Context, obj client.Object, name string) (bool, error) {
+	_, configMap := obj.(*corev1.ConfigMap)
+	_, secret := obj.(*corev1.Secret)
+	if !configMap && !secret {
+		return false, nil
+	}
+	cr := &olsv1alpha1.OLSConfig{}
+	if err := r.Get(ctx, client.ObjectKey{Name: utils.OLSConfigName}, cr); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, ref := range cr.Spec.OLSConfig.MCPKubeServerConfig.CAReferences() {
+		if configMap && ref.ConfigMap != nil && ref.ConfigMap.Name == name || secret && ref.Secret != nil && ref.Secret.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Named outputs can collide with user objects even after a CA reference is
+// removed. Never infer ownership solely from the output name or current refs.
+func requireMCPOutputOwnership(r reconciler.Reconciler, ctx context.Context, obj client.Object) error {
+	cr := &olsv1alpha1.OLSConfig{}
+	if err := r.Get(ctx, client.ObjectKey{Name: utils.OLSConfigName}, cr); err != nil {
+		return fmt.Errorf("cannot determine MCP output owner: %w", err)
+	}
+	if metav1.IsControlledBy(obj, cr) {
+		return nil
+	}
+	if _, secret := obj.(*corev1.Secret); secret {
+		// OpenShift service-ca owns the serving Secret through the originating
+		// Service, rather than OLSConfig directly.
+		service := &corev1.Service{}
+		if err := r.Get(ctx, client.ObjectKey{Name: utils.OpenShiftMCPServerServiceName, Namespace: r.GetNamespace()}, service); err != nil {
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("get MCP serving certificate owner: %w", err)
+			}
+		} else if metav1.IsControlledBy(service, cr) {
+			for _, owner := range obj.GetOwnerReferences() {
+				if owner.APIVersion == "v1" && owner.Kind == "Service" && owner.Name == service.Name && owner.UID == service.UID {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("refusing to modify or delete unowned MCP output %s", obj.GetName())
+}
+
 func deleteNamespacedObject(r reconciler.Reconciler, ctx context.Context, obj client.Object, name string) error {
+	if referenced, err := isUserCASource(r, ctx, obj, name); err != nil || referenced {
+		return err
+	}
 	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: r.GetNamespace()}, obj)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return err
+	}
+	switch obj.(type) {
+	case *corev1.ConfigMap, *corev1.Secret:
+		if err := requireMCPOutputOwnership(r, ctx, obj); err != nil {
+			return err
+		}
 	}
 	if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
 		return err

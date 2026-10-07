@@ -111,6 +111,13 @@ var _ = BeforeSuite(func() {
 	}
 	err = k8sClient.Get(ctx, crNamespacedName, cr)
 	Expect(err).NotTo(HaveOccurred())
+
+	certificate, _, err := generateMCPTestCA()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: utils.OLSCAConfigMap, Namespace: utils.OLSNamespaceDefault},
+		Data:       map[string]string{utils.AppOpenShiftMCPServerCACertFile: string(certificate)},
+	})).To(Succeed())
 })
 
 var _ = AfterSuite(func() {
@@ -124,11 +131,20 @@ func ensureMCPTLSSecret() {
 	Expect(err).NotTo(HaveOccurred())
 	secret.Name = utils.OpenShiftMCPServerCertsSecretName
 	secret.Namespace = utils.OLSNamespaceDefault
+	// Phase 2 creates the Service after this helper, so use the persisted CR
+	// as the managed serving certificate's owner.
+	Expect(cr.UID).NotTo(BeEmpty())
+	secret.OwnerReferences = []metav1.OwnerReference{
+		*metav1.NewControllerRef(cr, olsv1alpha1.GroupVersion.WithKind(utils.OLSConfigKind)),
+	}
 	err = k8sClient.Create(ctx, secret)
 	Expect(client.IgnoreAlreadyExists(err)).NotTo(HaveOccurred())
 }
 
 func ensureMCPConfigMap(testCR *olsv1alpha1.OLSConfig) {
+	// Use the persisted CR identity for real owner references in envtest.
+	testCR.UID = cr.UID
+	Expect(reconcileTrustConfigMap(testReconcilerInstance, ctx, testCR)).To(Succeed())
 	cm, err := GenerateConfigMap(testReconcilerInstance, testCR)
 	Expect(err).NotTo(HaveOccurred())
 

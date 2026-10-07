@@ -18,45 +18,6 @@ import (
 	"github.com/openshift/lightspeed-operator/internal/controller/utils"
 )
 
-// configTOML is the openshift-mcp-server runtime config.
-// Denied resources keep Secret (and RBAC) data out of the LLM path; toolsets are pinned
-// so upstream default changes do not affect OLS. Observability metrics uses in-cluster Thanos/Alertmanager.
-// read_only = false is required: openshift-mcp-server-rhel9 sets ReadOnly=true in build-time defaults;
-// omitting this leaves only readOnlyHint tools (no resources_create_or_update, etc.).
-var configTOML = fmt.Sprintf(`# Denied resources prevent the MCP server from accessing these Kubernetes resource types.
-# This ensures secret data never reaches the LLM through the shipped MCP server.
-# User-brought MCP servers (spec.mcpServers) are the user's responsibility to secure.
-# Toolsets are pinned explicitly so upstream default changes do not affect OLS.
-
-port = "%d"
-tls_cert = "%s"
-tls_key = "%s"
-read_only = false
-toolsets = ["core", "config", "helm", "observability/metrics", "kubevirt"]
-experimental_enable_target_compatibility_tool_filters = true
-
-[[denied_resources]]
-group = ""
-version = "v1"
-kind = "Secret"
-
-[[denied_resources]]
-group = "rbac.authorization.k8s.io"
-version = "v1"
-
-[toolset_configs."observability/metrics"]
-prometheus_url = "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
-alertmanager_url = "https://alertmanager-main.openshift-monitoring.svc.cluster.local:9094"
-# Query-safety PromQL checks (not RBAC). "!tsdb" disables TSDB-dependent guardrails that
-# OpenShift Thanos Querier often lacks (/api/v1/status/tsdb); other guardrails stay on.
-# Auth still uses the caller's bearer token forwarded to Thanos/Alertmanager.
-guardrails = "!tsdb"
-`,
-	utils.OpenShiftMCPServerHTTPSPort,
-	path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.crt"),
-	path.Join(utils.OpenShiftMCPServerTLSMountPath, "tls.key"),
-)
-
 func selectorLabels() map[string]string {
 	return map[string]string{
 		"app":                          utils.OpenShiftMCPServerDeploymentName,
@@ -79,6 +40,10 @@ func GenerateServiceAccount(r reconciler.Reconciler, cr *olsv1alpha1.OLSConfig) 
 
 // GenerateConfigMap generates the TOML ConfigMap for openshift-mcp-server.
 func GenerateConfigMap(r reconciler.Reconciler, cr *olsv1alpha1.OLSConfig) (*corev1.ConfigMap, error) {
+	configTOML, err := GenerateConfigTOML(cr.Spec.OLSConfig.MCPKubeServerConfig)
+	if err != nil {
+		return nil, err
+	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      utils.OpenShiftMCPServerConfigCmName,

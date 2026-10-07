@@ -881,7 +881,7 @@ func GetProxyCACertHash(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 
 // The callback function receives:
 //   - name: the secret name
-//   - source: a descriptive identifier of where the secret is used (e.g., "llm-provider-openai", "tls", "mcp-myserver")
+//   - source: a descriptive identifier of where the secret is used (e.g., "llm-provider-openai", "tls", "mcp-header-myserver", "mcp-ca")
 //
 // If fn returns an error, iteration stops immediately and that error is returned.
 // Returns nil if all iterations complete successfully.
@@ -912,6 +912,17 @@ func ForEachExternalSecret(cr *olsv1alpha1.OLSConfig, fn func(name string, sourc
 		}
 	}
 
+	// User-owned MCP backend/process CA sources are tracked only while MCP is enabled.
+	if BoolDeref(cr.Spec.OLSConfig.IntrospectionEnabled, true) {
+		for _, ref := range cr.Spec.OLSConfig.MCPKubeServerConfig.CAReferences() {
+			if ref.Secret != nil && ref.Secret.Name != "" {
+				if err := fn(ref.Secret.Name, "mcp-ca"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	// 3. MCP server header secrets (only for type "secret")
 	for _, mcpServer := range cr.Spec.MCPServers {
 		for _, header := range mcpServer.Headers {
@@ -922,7 +933,9 @@ func ForEachExternalSecret(cr *olsv1alpha1.OLSConfig, fn func(name string, sourc
 			if header.ValueFrom.SecretRef == nil || header.ValueFrom.SecretRef.Name == "" {
 				continue
 			}
-			if err := fn(header.ValueFrom.SecretRef.Name, "mcp-"+mcpServer.Name); err != nil {
+			// Keep header identifiers distinct from the mcp-ca source tag,
+			// including a user-defined server named "ca".
+			if err := fn(header.ValueFrom.SecretRef.Name, "mcp-header-"+mcpServer.Name); err != nil {
 				return err
 			}
 		}
@@ -970,6 +983,17 @@ func ForEachExternalConfigMap(cr *olsv1alpha1.OLSConfig, fn func(name string, so
 		if cmName != "" {
 			if err := fn(cmName, "proxy-ca"); err != nil {
 				return err
+			}
+		}
+	}
+
+	// The baseline service CA is already a system watch, not a user reference.
+	if BoolDeref(cr.Spec.OLSConfig.IntrospectionEnabled, true) {
+		for _, ref := range cr.Spec.OLSConfig.MCPKubeServerConfig.CAReferences() {
+			if ref.ConfigMap != nil && ref.ConfigMap.Name != "" {
+				if err := fn(ref.ConfigMap.Name, "mcp-ca"); err != nil {
+					return err
+				}
 			}
 		}
 	}

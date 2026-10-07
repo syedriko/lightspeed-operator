@@ -385,6 +385,21 @@ type MCPKubeServerConfiguration struct {
 	// +kubebuilder:validation:Minimum=5
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Timeout (seconds)"
 	Timeout int `json:"timeout,omitempty"`
+
+	// Toolsets is a complete replacement selection. Nil preserves operator defaults;
+	// a pointer to an empty slice selects no toolsets. No admission default is applied.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=17
+	// +kubebuilder:validation:XValidation:rule="self.all(s, self.filter(t, (has(s.core) && has(t.core)) || (has(s.config) && has(t.config)) || (has(s.helm) && has(t.helm)) || (has(s.kcp) && has(t.kcp)) || (has(s.ossm) && has(t.ossm)) || (has(s.kubevirt) && has(t.kubevirt)) || (has(s.netobserv) && has(t.netobserv)) || (has(s.tekton) && has(t.tekton)) || (has(s.cluster__dash__diagnostics) && has(t.cluster__dash__diagnostics)) || (has(s.cni__dash__diagnostics) && has(t.cni__dash__diagnostics)) || (has(s.netedge) && has(t.netedge)) || (has(s.oadp) && has(t.oadp)) || (has(s.ovn__dash__kubernetes) && has(t.ovn__dash__kubernetes)) || (has(s.observability__slash__metrics) && has(t.observability__slash__metrics)) || (has(s.observability__slash__logs) && has(t.observability__slash__logs)) || (has(s.observability__slash__traces) && has(t.observability__slash__traces)) || (has(s.observability__slash__otelcol) && has(t.observability__slash__otelcol))).size() == 1)",message="toolsets must be unique selections of supported toolsets; openshift/mustgather is unsupported"
+	Toolsets *[]MCPToolsetSelection `json:"toolsets,omitempty"`
+
+	// CABundleRefs augments shared MCP process trust; omitted/empty preserves baseline trust.
+	// References resolve in the operand namespace and remain user-owned.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	CABundleRefs []MCPCAReference `json:"caBundleRefs,omitempty"`
 }
 
 // RAGSpec defines a BYOK RAG database (container image and index path).

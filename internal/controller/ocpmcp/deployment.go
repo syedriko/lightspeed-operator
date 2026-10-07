@@ -3,6 +3,7 @@ package ocpmcp
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -43,7 +44,7 @@ func getSecretResourceVersion(r reconciler.Reconciler, ctx context.Context, secr
 }
 
 // GenerateDeployment generates the standalone openshift-mcp-server Deployment with
-// service-ca TLS (--tls-cert/--tls-key), HTTPS probes on /healthz, and user-configurable replicas.
+// service-ca TLS configured through TOML, HTTPS probes, and configurable replicas.
 func GenerateDeployment(r reconciler.Reconciler, ctx context.Context, cr *olsv1alpha1.OLSConfig) (*appsv1.Deployment, error) {
 	revisionHistoryLimit := int32(1)
 	runAsNonRoot := true
@@ -57,6 +58,18 @@ func GenerateDeployment(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 		return nil, err
 	}
 
+	trust, err := GenerateTrustConfigMap(r, ctx, cr)
+	if err != nil {
+		return nil, err
+	}
+	persistedTrust := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(trust), persistedTrust); err != nil {
+		return nil, fmt.Errorf("%s: %w", utils.ErrReconcileOpenShiftMCPServerTrust, err)
+	}
+	if !utils.ConfigMapEqual(trust, persistedTrust) || trust.Annotations[trustHashAnnotation] != persistedTrust.Annotations[trustHashAnnotation] {
+		return nil, fmt.Errorf("%s: certificate sources changed; reconcile the validated snapshot before rollout", utils.ErrReconcileOpenShiftMCPServerTrust)
+	}
+	caVolumes, caMounts := trustVolumes(cr.Spec.OLSConfig.MCPKubeServerConfig)
 	configVolume, configMount := GetConfigVolumeAndMount()
 	tlsVolumeDefaultMode := utils.VolumeRestrictedMode
 	httpsPort := intstr.FromInt32(utils.OpenShiftMCPServerHTTPSPort)
@@ -79,7 +92,8 @@ func GenerateDeployment(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 			RevisionHistoryLimit: &revisionHistoryLimit,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: selectorLabels(),
+					Labels:      selectorLabels(),
+					Annotations: map[string]string{trustHashAnnotation: trust.Annotations[trustHashAnnotation]},
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: utils.OpenShiftMCPServerServiceAccountName,
@@ -166,6 +180,11 @@ func GenerateDeployment(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 		},
 	}
 
+	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, caVolumes...)
+	container := &deployment.Spec.Template.Spec.Containers[0]
+	container.VolumeMounts = append(container.VolumeMounts, caMounts...)
+	container.Env = append(container.Env, corev1.EnvVar{Name: "SSL_CERT_DIR", Value: sharedCertDirectories})
+
 	utils.ApplyPodDeploymentConfig(deployment, cr.Spec.OLSConfig.DeploymentConfig.MCPServerContainer, true)
 
 	if err := controllerutil.SetControllerReference(cr, deployment, r.GetScheme()); err != nil {
@@ -178,7 +197,9 @@ func GenerateDeployment(r reconciler.Reconciler, ctx context.Context, cr *olsv1a
 // UpdateDeployment updates the MCP Deployment when the pod spec, config ConfigMap, or TLS Secret changes.
 func UpdateDeployment(r reconciler.Reconciler, ctx context.Context, existingDeployment, desiredDeployment *appsv1.Deployment) error {
 	utils.SetDefaults_Deployment(desiredDeployment)
-	changed := !utils.DeploymentSpecEqual(&existingDeployment.Spec, &desiredDeployment.Spec, false)
+	changed := !utils.DeploymentSpecEqual(&existingDeployment.Spec, &desiredDeployment.Spec, false) ||
+		existingDeployment.Spec.Template.Annotations[trustHashAnnotation] != desiredDeployment.Spec.Template.Annotations[trustHashAnnotation] ||
+		!reflect.DeepEqual(existingDeployment.Spec.Template.Spec.Volumes, desiredDeployment.Spec.Template.Spec.Volumes)
 
 	if existingDeployment.Annotations[utils.OpenShiftMCPServerConfigMapResourceVersionAnnotation] !=
 		desiredDeployment.Annotations[utils.OpenShiftMCPServerConfigMapResourceVersionAnnotation] {

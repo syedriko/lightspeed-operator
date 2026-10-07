@@ -3,6 +3,7 @@ package watchers
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -88,11 +89,122 @@ func isSystemConfigMap(r reconciler.Reconciler, obj client.Object) bool {
 	return false
 }
 
+// An old annotation is not an active consumer. References can be removed before
+// the next source event, and must not fall back to app-server restarts.
+func hasCurrentExternalReference(r reconciler.Reconciler, ctx context.Context, name string, secret bool) bool {
+	cr := &olsv1alpha1.OLSConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: utils.OLSConfigName}, cr); err != nil {
+		return true // Preserve existing routing when the CR cannot be inspected.
+	}
+	enumerate := utils.ForEachExternalConfigMap
+	if secret {
+		enumerate = utils.ForEachExternalSecret
+	}
+	found := false
+	_ = enumerate(cr, func(candidate, _ string) error {
+		found = found || candidate == name
+		return nil
+	})
+	return found
+}
+
 func enqueueOLSConfig(q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	if q == nil {
 		return
 	}
 	q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: utils.OLSConfigName}})
+}
+
+// handleMCPCAEvent queues validation before MCP can roll. User CA sources are
+// never passed to the MCP restart callback. Other consumers of the same object
+// still restart, even before annotations/mappings have been published.
+// A true result means the user-reference event has been fully handled.
+func handleMCPCAEvent(r reconciler.Reconciler, ctx context.Context, obj client.Object,
+	q workqueue.TypedRateLimitingInterface[reconcile.Request], restart bool) bool {
+	if obj.GetNamespace() != r.GetNamespace() {
+		return false
+	}
+	_, secret := obj.(*v1.Secret)
+	cr := &olsv1alpha1.OLSConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: utils.OLSConfigName}, cr); err != nil {
+		return false
+	}
+	enabled := utils.BoolDeref(cr.Spec.OLSConfig.IntrospectionEnabled, true)
+	baseline := !secret && obj.GetName() == utils.OLSCAConfigMap
+	referenced := false
+	// Inspect ungated refs as well to suppress stale annotations after disable.
+	for _, ref := range cr.Spec.OLSConfig.MCPKubeServerConfig.CAReferences() {
+		if secret && ref.Secret != nil && ref.Secret.Name == obj.GetName() ||
+			!secret && ref.ConfigMap != nil && ref.ConfigMap.Name == obj.GetName() {
+			referenced = true
+			break
+		}
+	}
+	if !baseline && !referenced {
+		return false
+	}
+	if enabled {
+		enqueueOLSConfig(q)
+	}
+	enumerate := utils.ForEachExternalConfigMap
+	if secret {
+		enumerate = utils.ForEachExternalSecret
+	}
+	targets := make(map[string]bool)
+	_ = enumerate(cr, func(name, source string) error {
+		if name != obj.GetName() || source == "mcp-ca" {
+			return nil
+		}
+		if secret && strings.HasPrefix(source, "llm-provider-") &&
+			utils.BoolDeref(cr.Spec.OLSConfig.CredentialHotReload, false) {
+			return nil
+		}
+		if source == "alerts-adapter" {
+			targets[utils.AlertsAdapterDeploymentName] = true
+		} else {
+			targets[utils.OLSAppServerDeploymentName] = true
+			if source == "tls" {
+				targets[utils.ConsoleUIDeploymentName] = true
+			}
+		}
+		return nil
+	})
+	// Preserve system consumers as well as user consumers of the same source.
+	// Keep system callback order, and never bypass validation with an MCP roll.
+	var systemTargets []string
+	system := baseline
+	if wc, ok := r.GetWatcherConfig().(*utils.WatcherConfig); ok && wc != nil {
+		if secret {
+			for _, source := range wc.Secrets.SystemResources {
+				if source.Name == obj.GetName() && source.Namespace == obj.GetNamespace() && wc.IsSystemSecretWatchEnabled(source) {
+					system = true
+					systemTargets = append(systemTargets, source.AffectedDeployments...)
+				}
+			}
+		} else {
+			for _, source := range wc.ConfigMaps.SystemResources {
+				if source.Name == obj.GetName() && source.Namespace == obj.GetNamespace() {
+					system = true
+					systemTargets = append(systemTargets, source.AffectedDeployments...)
+				}
+			}
+		}
+	}
+	if !restart && !enabled && (system || len(targets) > 0) {
+		enqueueOLSConfig(q) // Deletion still revalidates non-MCP consumers.
+	}
+	if restart {
+		for _, target := range systemTargets {
+			if target != utils.OpenShiftMCPServerDeploymentName {
+				restartDeployment(r, ctx, []string{target}, obj.GetNamespace(), obj.GetName())
+			}
+			delete(targets, target)
+		}
+		for target := range targets {
+			restartDeployment(r, ctx, []string{target}, obj.GetNamespace(), obj.GetName())
+		}
+	}
+	return true
 }
 
 // SecretUpdateHandler handles update events for Secrets and triggers deployment restarts when data changes.
@@ -102,12 +214,19 @@ type SecretUpdateHandler struct {
 
 // Create implements handler.EventHandler - handle creation of watched secrets
 // This handles the case where a watched secret is created or recreated.
-// Instead of triggering full reconciliation, we check if the secret is referenced in the CR,
-// annotate it if needed, and directly trigger deployment restarts.
+// MCP CA sources enqueue reconciliation for validation. Other sources are
+// annotated if referenced and restart their consumers directly.
 func (h *SecretUpdateHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	obj := evt.Object
 	secret, ok := obj.(*v1.Secret)
 	if !ok {
+		return
+	}
+
+	if secret.Namespace != h.Reconciler.GetNamespace() {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, secret, q, true) {
 		return
 	}
 
@@ -163,7 +282,12 @@ func (h *SecretUpdateHandler) Update(ctx context.Context, evt event.UpdateEvent,
 		return
 	}
 
-	// Data changed - restart affected deployments directly
+	if newSecret.Namespace != h.Reconciler.GetNamespace() && !isSystemSecret(h.Reconciler, newSecret) {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, newSecret, q, true) {
+		return
+	}
 	SecretWatcherFilter(h.Reconciler, ctx, newSecret)
 }
 
@@ -172,7 +296,10 @@ func (h *SecretUpdateHandler) Update(ctx context.Context, evt event.UpdateEvent,
 // Owned secrets are skipped; Owns() already requeues those.
 func (h *SecretUpdateHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	obj := evt.Object
-	if obj == nil || ownedByOLSConfig(obj) {
+	if obj == nil || obj.GetNamespace() != h.Reconciler.GetNamespace() && !isSystemSecret(h.Reconciler, obj) {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, obj, q, false) || ownedByOLSConfig(obj) {
 		return
 	}
 	if isSystemSecret(h.Reconciler, obj) {
@@ -200,12 +327,19 @@ type ConfigMapUpdateHandler struct {
 
 // Create implements handler.EventHandler - handle creation of watched configmaps
 // This handles the case where a watched configmap is created or recreated.
-// Instead of triggering full reconciliation, we check if the configmap is referenced in the CR,
-// annotate it if needed, and directly trigger deployment restarts.
+// MCP CA sources enqueue reconciliation for validation. Other sources are
+// annotated if referenced and restart their consumers directly.
 func (h *ConfigMapUpdateHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	obj := evt.Object
 	cm, ok := obj.(*v1.ConfigMap)
 	if !ok {
+		return
+	}
+
+	if cm.Namespace != h.Reconciler.GetNamespace() {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, cm, q, true) {
 		return
 	}
 
@@ -262,7 +396,12 @@ func (h *ConfigMapUpdateHandler) Update(ctx context.Context, evt event.UpdateEve
 		return
 	}
 
-	// Data changed - restart affected deployments directly
+	if newCM.Namespace != h.Reconciler.GetNamespace() && !isSystemConfigMap(h.Reconciler, newCM) {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, newCM, q, true) {
+		return
+	}
 	ConfigMapWatcherFilter(h.Reconciler, ctx, newCM)
 }
 
@@ -271,7 +410,10 @@ func (h *ConfigMapUpdateHandler) Update(ctx context.Context, evt event.UpdateEve
 // Owned configmaps are skipped; Owns() already requeues those.
 func (h *ConfigMapUpdateHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	obj := evt.Object
-	if obj == nil || ownedByOLSConfig(obj) {
+	if obj == nil || obj.GetNamespace() != h.Reconciler.GetNamespace() && !isSystemConfigMap(h.Reconciler, obj) {
+		return
+	}
+	if handleMCPCAEvent(h.Reconciler, ctx, obj, q, false) || ownedByOLSConfig(obj) {
 		return
 	}
 	if isSystemConfigMap(h.Reconciler, obj) {
@@ -343,6 +485,9 @@ func SecretWatcherFilter(r reconciler.Reconciler, ctx context.Context, obj clien
 	// Check 2: Look for watcher annotation (user-provided secrets)
 	if _, exist := annotations[utils.WatcherAnnotationKey]; exist {
 		secretName := obj.GetName()
+		if !hasCurrentExternalReference(r, ctx, secretName, true) {
+			return
+		}
 
 		// For annotated secrets, determine affected deployments from mapping
 		var affectedDeployments []string
@@ -413,6 +558,9 @@ func ConfigMapWatcherFilter(r reconciler.Reconciler, ctx context.Context, obj cl
 
 	// Check 2: Look for watcher annotation (user-provided configmaps)
 	if _, exist := annotations[utils.WatcherAnnotationKey]; exist {
+		if !hasCurrentExternalReference(r, ctx, obj.GetName(), false) {
+			return
+		}
 		// For annotated configmaps, determine affected deployments from mapping
 		configMapName := obj.GetName()
 		var affectedDeployments []string

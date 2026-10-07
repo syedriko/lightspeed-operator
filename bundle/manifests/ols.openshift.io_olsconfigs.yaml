@@ -1882,12 +1882,576 @@ spec:
                   mcpKubeServerConfig:
                     description: MCP Kubernetes server configuration
                     properties:
+                      caBundleRefs:
+                        description: |-
+                          CABundleRefs augments shared MCP process trust; omitted/empty preserves baseline trust.
+                          References resolve in the operand namespace and remain user-owned.
+                        items:
+                          description: MCPCAReference references user-owned certificate
+                            data, never an arbitrary path.
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            configMap:
+                              description: MCPCAKeyReference selects one certificate-bundle
+                                key in a local object.
+                              properties:
+                                key:
+                                  description: Key is an explicit data key; no default
+                                    is applied.
+                                  maxLength: 253
+                                  minLength: 1
+                                  pattern: ^[-._a-zA-Z0-9]+$
+                                  type: string
+                                name:
+                                  description: Name is a ConfigMap or Secret DNS subdomain
+                                    name in the operand namespace.
+                                  maxLength: 253
+                                  minLength: 1
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                            secret:
+                              description: MCPCAKeyReference selects one certificate-bundle
+                                key in a local object.
+                              properties:
+                                key:
+                                  description: Key is an explicit data key; no default
+                                    is applied.
+                                  maxLength: 253
+                                  minLength: 1
+                                  pattern: ^[-._a-zA-Z0-9]+$
+                                  type: string
+                                name:
+                                  description: Name is a ConfigMap or Secret DNS subdomain
+                                    name in the operand namespace.
+                                  maxLength: 253
+                                  minLength: 1
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                          type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of configMap or secret is required
+                            rule: has(self.configMap) != has(self.secret)
+                        maxItems: 64
+                        type: array
+                        x-kubernetes-list-type: atomic
                       timeout:
                         default: 60
                         description: Timeout for the MCP Kube server in seconds, default
                           is 60
                         minimum: 5
                         type: integer
+                      toolsets:
+                        description: |-
+                          Toolsets is a complete replacement selection. Nil preserves operator defaults;
+                          a pointer to an empty slice selects no toolsets. No admission default is applied.
+                        items:
+                          description: |-
+                            MCPToolsetSelection selects exactly one of the 17 supported toolsets.
+                            Unknown-only entries (including openshift/mustgather) become empty after
+                            pruning and are rejected; mixed recognized/unknown keys require Strict field
+                            validation to reject the unknown key rather than silently prune it.
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            cluster-diagnostics:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            cni-diagnostics:
+                              description: |-
+                                MCPCNIDiagnosticsConfig overrides diagnostic helper images, not MCP privileges.
+                                The bounded reference pattern accepts conventional repository names, optional
+                                registry/port, tag and sha256 digest. It is syntax-only, not pull/compatibility
+                                validation; exotic registry authorities and non-sha256 digests are unsupported.
+                              properties:
+                                kernelDebugImage:
+                                  maxLength: 512
+                                  pattern: ^((localhost|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+)(:[0-9]+)?/|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?:[0-9]+/)?[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*(/[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*)*(:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$
+                                  type: string
+                                pwruImage:
+                                  maxLength: 512
+                                  pattern: ^((localhost|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+)(:[0-9]+)?/|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?:[0-9]+/)?[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*(/[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*)*(:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$
+                                  type: string
+                                tcpdumpImage:
+                                  maxLength: 512
+                                  pattern: ^((localhost|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+)(:[0-9]+)?/|[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?:[0-9]+/)?[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*(/[a-z0-9]+(([._]|__|[-]+)[a-z0-9]+)*)*(:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$
+                                  type: string
+                              type: object
+                            config:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            core:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            helm:
+                              description: MCPHelmConfig configures ConfigMap-backed
+                                release storage and registry allowlisting.
+                              properties:
+                                allowedRegistries:
+                                  description: AllowedRegistries uses upstream normalized
+                                    scheme/host and path-prefix matching.
+                                  items:
+                                    maxLength: 2048
+                                    type: string
+                                    x-kubernetes-validations:
+                                    - message: registry must be an absolute HTTPS
+                                        or OCI URL with a host and no userinfo
+                                      rule: isURL(self) && url(self).getScheme() in
+                                        ['https', 'oci'] && url(self).getHostname()
+                                        != '' && !self.matches('^[^:]+://[^/?#]*@')
+                                  maxItems: 64
+                                  type: array
+                                storageDriver:
+                                  description: StorageDriver defaults to configmap
+                                    for explicit selection. Secret storage is unsupported.
+                                  enum:
+                                  - configmap
+                                  type: string
+                              type: object
+                            kcp:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            kubevirt:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            netedge:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            netobserv:
+                              description: |-
+                                MCPNetObservConfig selects either an explicit URL with CA or a Service endpoint.
+                                Defaults are computed by generation, not admission, to preserve field presence.
+                              properties:
+                                caBundleRef:
+                                  description: MCPCAReference references user-owned
+                                    certificate data, never an arbitrary path.
+                                  maxProperties: 1
+                                  minProperties: 1
+                                  properties:
+                                    configMap:
+                                      description: MCPCAKeyReference selects one certificate-bundle
+                                        key in a local object.
+                                      properties:
+                                        key:
+                                          description: Key is an explicit data key;
+                                            no default is applied.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[-._a-zA-Z0-9]+$
+                                          type: string
+                                        name:
+                                          description: Name is a ConfigMap or Secret
+                                            DNS subdomain name in the operand namespace.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    secret:
+                                      description: MCPCAKeyReference selects one certificate-bundle
+                                        key in a local object.
+                                      properties:
+                                        key:
+                                          description: Key is an explicit data key;
+                                            no default is applied.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[-._a-zA-Z0-9]+$
+                                          type: string
+                                        name:
+                                          description: Name is a ConfigMap or Secret
+                                            DNS subdomain name in the operand namespace.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly one of configMap or secret is
+                                      required
+                                    rule: has(self.configMap) != has(self.secret)
+                                namespace:
+                                  description: Namespace defaults to netobserv in
+                                    Service form only.
+                                  maxLength: 63
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                                port:
+                                  description: Port defaults to 9001 in Service form
+                                    only.
+                                  format: int32
+                                  maximum: 65535
+                                  minimum: 1
+                                  type: integer
+                                service:
+                                  description: Service defaults to netobserv-plugin
+                                    in Service form only.
+                                  maxLength: 63
+                                  pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                                url:
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: url must be an absolute HTTPS endpoint
+                                      with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                              type: object
+                              x-kubernetes-validations:
+                              - message: url conflicts with namespace, service and
+                                  port
+                                rule: '!has(self.url) || (!has(self.__namespace__)
+                                  && !has(self.service) && !has(self.port))'
+                              - message: an explicit url requires caBundleRef
+                                rule: '!has(self.url) || has(self.caBundleRef)'
+                            oadp:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            observability/logs:
+                              description: MCPLogsConfig selects a static Loki endpoint
+                                or HTTPS Route discovery.
+                              properties:
+                                authMode:
+                                  enum:
+                                  - header
+                                  - kubeconfig
+                                  type: string
+                                lokiURL:
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: lokiURL must be an absolute HTTPS endpoint
+                                      with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                                useRoute:
+                                  type: boolean
+                                  x-kubernetes-validations:
+                                  - message: useRoute must be true; HTTP Service discovery
+                                      is unsupported
+                                    rule: self
+                              type: object
+                              x-kubernetes-validations:
+                              - message: lokiURL conflicts with an explicit useRoute
+                                rule: '!has(self.lokiURL) || !has(self.useRoute)'
+                            observability/metrics:
+                              description: |-
+                                MCPMetricsConfig configures verified HTTPS observability metrics endpoints.
+                                Guardrail grammar follows the pinned upstream parser: case-insensitive,
+                                whitespace-trimmed, empty tokens ignored, and signs never mixed. Comma-only
+                                lists disable all configurable rules; an empty whole value enables all.
+                                Regex checks operate directly on bounded strings: Kubernetes 1.27's CEL cost
+                                estimator does not propagate string bounds through split/trim/lowerAscii.
+                                [[:space:]\p{Z}\x{0085}] matches Go TrimSpace's Unicode whitespace set.
+                              properties:
+                                alertmanagerURL:
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: alertmanagerURL must be an absolute HTTPS
+                                      endpoint with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                                authMode:
+                                  description: AuthMode defaults to header; kubeconfig
+                                    uses derived caller credentials.
+                                  enum:
+                                  - header
+                                  - kubeconfig
+                                  type: string
+                                guardrails:
+                                  description: Guardrails defaults to !tsdb without
+                                    prometheusURL, otherwise all.
+                                  maxLength: 512
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: 'invalid guardrails: use all, none, positive
+                                      rule names, or negative rule names (including
+                                      !tsdb), without mixing signs'
+                                    rule: self.matches(r'^[a-zA-Z!,[:space:]\p{Z}\x{0085}-]*$')
+                                      && (self.matches(r'(?i)^[[:space:]\p{Z}\x{0085}]*(all|none)?[[:space:]\p{Z}\x{0085}]*$')
+                                      || self.matches(r'(?i)^[[:space:]\p{Z}\x{0085}]*(disallow-explicit-name-label|require-label-matcher|disallow-blanket-regex|max-metric-cardinality)?[[:space:]\p{Z}\x{0085}]*(,[[:space:]\p{Z}\x{0085}]*(disallow-explicit-name-label|require-label-matcher|disallow-blanket-regex|max-metric-cardinality)?[[:space:]\p{Z}\x{0085}]*)*$')
+                                      || self.matches(r'(?i)^[[:space:]\p{Z}\x{0085}]*(!(disallow-explicit-name-label|require-label-matcher|disallow-blanket-regex|max-metric-cardinality|tsdb))?[[:space:]\p{Z}\x{0085}]*(,[[:space:]\p{Z}\x{0085}]*(!(disallow-explicit-name-label|require-label-matcher|disallow-blanket-regex|max-metric-cardinality|tsdb))?[[:space:]\p{Z}\x{0085}]*)*$'))
+                                maxLabelCardinality:
+                                  description: Zero means always reject blanket regex.
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                                maxMetricCardinality:
+                                  format: int64
+                                  minimum: 1
+                                  type: integer
+                                prometheusURL:
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: prometheusURL must be an absolute HTTPS
+                                      endpoint with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                                rangeQueryFullResponse:
+                                  type: boolean
+                              type: object
+                              x-kubernetes-validations:
+                              - message: maxMetricCardinality requires the effective
+                                  max-metric-cardinality guardrail (default !tsdb
+                                  disables it)
+                                rule: '!has(self.maxMetricCardinality) || (has(self.guardrails)
+                                  ? (self.guardrails.matches(r''(?i)^[[:space:]\p{Z}\x{0085}]*(all)?[[:space:]\p{Z}\x{0085}]*$'')
+                                  || (self.guardrails.contains(''!'') ? !self.guardrails.matches(r''(?i)(^|,)[[:space:]\p{Z}\x{0085}]*!(tsdb|max-metric-cardinality)[[:space:]\p{Z}\x{0085}]*(,|$)'')
+                                  : self.guardrails.matches(r''(?i)(^|,)[[:space:]\p{Z}\x{0085}]*max-metric-cardinality[[:space:]\p{Z}\x{0085}]*(,|$)'')))
+                                  : has(self.prometheusURL))'
+                              - message: maxLabelCardinality requires the effective
+                                  disallow-blanket-regex guardrail (default !tsdb
+                                  disables it)
+                                rule: '!has(self.maxLabelCardinality) || (has(self.guardrails)
+                                  ? (self.guardrails.matches(r''(?i)^[[:space:]\p{Z}\x{0085}]*(all)?[[:space:]\p{Z}\x{0085}]*$'')
+                                  || (self.guardrails.contains(''!'') ? !self.guardrails.matches(r''(?i)(^|,)[[:space:]\p{Z}\x{0085}]*!(tsdb|disallow-blanket-regex)[[:space:]\p{Z}\x{0085}]*(,|$)'')
+                                  : self.guardrails.matches(r''(?i)(^|,)[[:space:]\p{Z}\x{0085}]*disallow-blanket-regex[[:space:]\p{Z}\x{0085}]*(,|$)'')))
+                                  : has(self.prometheusURL))'
+                            observability/otelcol:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            observability/traces:
+                              description: MCPTracesConfig selects a static Tempo
+                                API base or HTTPS Route discovery.
+                              properties:
+                                authMode:
+                                  enum:
+                                  - header
+                                  - kubeconfig
+                                  type: string
+                                tempoURL:
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: tempoURL must be an absolute HTTPS endpoint
+                                      with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                                useRoute:
+                                  type: boolean
+                                  x-kubernetes-validations:
+                                  - message: useRoute must be true; HTTP Service discovery
+                                      is unsupported
+                                    rule: self
+                              type: object
+                              x-kubernetes-validations:
+                              - message: tempoURL conflicts with an explicit useRoute
+                                rule: '!has(self.tempoURL) || !has(self.useRoute)'
+                            ossm:
+                              description: MCPOSSMConfig configures a verified HTTPS
+                                Kiali endpoint.
+                              properties:
+                                caBundleRef:
+                                  description: CABundleRef is required; source existence
+                                    and PEM are checked during reconciliation.
+                                  maxProperties: 1
+                                  minProperties: 1
+                                  properties:
+                                    configMap:
+                                      description: MCPCAKeyReference selects one certificate-bundle
+                                        key in a local object.
+                                      properties:
+                                        key:
+                                          description: Key is an explicit data key;
+                                            no default is applied.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[-._a-zA-Z0-9]+$
+                                          type: string
+                                        name:
+                                          description: Name is a ConfigMap or Secret
+                                            DNS subdomain name in the operand namespace.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    secret:
+                                      description: MCPCAKeyReference selects one certificate-bundle
+                                        key in a local object.
+                                      properties:
+                                        key:
+                                          description: Key is an explicit data key;
+                                            no default is applied.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[-._a-zA-Z0-9]+$
+                                          type: string
+                                        name:
+                                          description: Name is a ConfigMap or Secret
+                                            DNS subdomain name in the operand namespace.
+                                          maxLength: 253
+                                          minLength: 1
+                                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly one of configMap or secret is
+                                      required
+                                    rule: has(self.configMap) != has(self.secret)
+                                url:
+                                  description: URL must be an absolute HTTPS endpoint
+                                    with a host and no userinfo.
+                                  maxLength: 2048
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: url must be an absolute HTTPS endpoint
+                                      with a host and no userinfo
+                                    rule: isURL(self) && url(self).getScheme() ==
+                                      'https' && url(self).getHostname() != '' &&
+                                      !self.matches('^[^:]+://[^/?#]*@')
+                              required:
+                              - caBundleRef
+                              - url
+                              type: object
+                            ovn-kubernetes:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                            tekton:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                MCPEmptyConfig selects a toolset with no supported configuration.
+                                A zero-property map rejects unknown settings and remains CEL-compatible on
+                                Kubernetes 1.27, whose CEL object adapter cannot handle propertyless structs.
+                                Unknown settings in typed configurable blocks are still pruned unless the
+                                request uses fieldValidation=Strict; CEL cannot inspect pruned fields.
+                              maxProperties: 0
+                              type: object
+                          type: object
+                          x-kubernetes-validations:
+                          - message: select exactly one supported toolset; openshift/mustgather
+                              is unsupported
+                            rule: '[has(self.core), has(self.config), has(self.helm),
+                              has(self.kcp), has(self.ossm), has(self.kubevirt), has(self.netobserv),
+                              has(self.tekton), has(self.cluster__dash__diagnostics),
+                              has(self.cni__dash__diagnostics), has(self.netedge),
+                              has(self.oadp), has(self.ovn__dash__kubernetes), has(self.observability__slash__metrics),
+                              has(self.observability__slash__logs), has(self.observability__slash__traces),
+                              has(self.observability__slash__otelcol)].filter(selected,
+                              selected).size() == 1'
+                        maxItems: 17
+                        type: array
+                        x-kubernetes-list-type: atomic
+                        x-kubernetes-validations:
+                        - message: toolsets must be unique selections of supported
+                            toolsets; openshift/mustgather is unsupported
+                          rule: self.all(s, self.filter(t, (has(s.core) && has(t.core))
+                            || (has(s.config) && has(t.config)) || (has(s.helm) &&
+                            has(t.helm)) || (has(s.kcp) && has(t.kcp)) || (has(s.ossm)
+                            && has(t.ossm)) || (has(s.kubevirt) && has(t.kubevirt))
+                            || (has(s.netobserv) && has(t.netobserv)) || (has(s.tekton)
+                            && has(t.tekton)) || (has(s.cluster__dash__diagnostics)
+                            && has(t.cluster__dash__diagnostics)) || (has(s.cni__dash__diagnostics)
+                            && has(t.cni__dash__diagnostics)) || (has(s.netedge) &&
+                            has(t.netedge)) || (has(s.oadp) && has(t.oadp)) || (has(s.ovn__dash__kubernetes)
+                            && has(t.ovn__dash__kubernetes)) || (has(s.observability__slash__metrics)
+                            && has(t.observability__slash__metrics)) || (has(s.observability__slash__logs)
+                            && has(t.observability__slash__logs)) || (has(s.observability__slash__traces)
+                            && has(t.observability__slash__traces)) || (has(s.observability__slash__otelcol)
+                            && has(t.observability__slash__otelcol))).size() == 1)
                     type: object
                   proxyConfig:
                     description: Proxy settings for connecting to external servers,

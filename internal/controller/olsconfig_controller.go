@@ -344,7 +344,9 @@ func (r *OLSConfigReconciler) reconcileIndependentResources(ctx context.Context,
 				return ocpmcp.ReconcileResources(r, ctx, cr)
 			},
 		})
-	} else if wasComponentEnabled(olsconfig, utils.TypeMCPServerReady) {
+	} else {
+		// Validation failures can replace readiness conditions; cleanup must not
+		// depend on status history when introspection is explicitly disabled.
 		if err := ocpmcp.Remove(r, ctx); err != nil {
 			resourceFailures["openshift-mcp-server cleanup"] = fmt.Errorf("%s: %w", utils.ErrRemoveOpenShiftMCPServerResources, err)
 		}

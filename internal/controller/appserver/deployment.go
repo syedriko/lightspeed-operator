@@ -423,7 +423,7 @@ func GenerateOLSDeployment(r reconciler.Reconciler, cr *olsv1alpha1.OLSConfig) (
 	// mount the volumes and add Volume mounts for the MCP server headers
 	// Note: Callback never returns an error, using ForEach for convenient iteration
 	_ = utils.ForEachExternalSecret(cr, func(name, source string) error {
-		if strings.HasPrefix(source, "mcp-") {
+		if strings.HasPrefix(source, "mcp-") && source != "mcp-ca" {
 			volumes = append(volumes, corev1.Volume{
 				Name: "header-" + name,
 				VolumeSource: corev1.VolumeSource{

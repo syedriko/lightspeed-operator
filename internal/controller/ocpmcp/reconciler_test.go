@@ -1,6 +1,7 @@
 package ocpmcp
 
 import (
+	"github.com/BurntSushi/toml"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	olsv1alpha1 "github.com/openshift/lightspeed-operator/api/v1alpha1"
@@ -30,6 +31,7 @@ func expectOwnedByOLSConfig(obj metav1.Object) {
 	}
 	Expect(ownerRef).NotTo(BeNil(), "expected %T %s to be owned by OLSConfig", obj, obj.GetName())
 	Expect(ownerRef.Name).To(Equal(olsConfig.Name))
+	Expect(ownerRef.UID).To(Equal(olsConfig.UID))
 }
 
 var _ = Describe("OpenShift MCP Server reconciler", Ordered, func() {
@@ -54,7 +56,19 @@ var _ = Describe("OpenShift MCP Server reconciler", Ordered, func() {
 			}, cm)
 			Expect(err).NotTo(HaveOccurred())
 			expectOwnedByOLSConfig(cm)
-			Expect(cm.Data[utils.OpenShiftMCPServerConfigFilename]).To(ContainSubstring(`kind = "Secret"`))
+			var config mcpRuntimeConfig
+			_, err = toml.Decode(cm.Data[utils.OpenShiftMCPServerConfigFilename], &config)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(config.DeniedResources).To(ContainElement(mcpDeniedResource{Group: "", Version: "v1", Kind: "Secret"}))
+		})
+
+		It("should create the owned validated MCP trust snapshot", func() {
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: trustConfigMapName, Namespace: utils.OLSNamespaceDefault}, cm)).To(Succeed())
+			expectOwnedByOLSConfig(cm)
+			Expect(cm.Data).To(HaveLen(1))
+			Expect(validateCABundle([]byte(cm.Data["service-ca.crt"]))).To(Succeed())
+			Expect(cm.Annotations[trustHashAnnotation]).NotTo(BeEmpty())
 		})
 
 		It("should create the MCP ServiceAccount", func() {
@@ -125,6 +139,9 @@ var _ = Describe("OpenShift MCP Server reconciler", Ordered, func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      utils.LegacyOpenShiftMCPServerCAConfigMapName,
 					Namespace: utils.OLSNamespaceDefault,
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(cr, olsv1alpha1.GroupVersion.WithKind(utils.OLSConfigKind)),
+					},
 				},
 				Data: map[string]string{"service-ca.crt": "stale"},
 			}
@@ -262,6 +279,7 @@ var _ = Describe("OpenShift MCP Server reconciler", Ordered, func() {
 
 			for _, name := range []string{
 				utils.OpenShiftMCPServerConfigCmName,
+				trustConfigMapName,
 			} {
 				cm := &corev1.ConfigMap{}
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: utils.OLSNamespaceDefault}, cm)
@@ -295,6 +313,7 @@ var _ = Describe("OpenShift MCP Server reconciler", Ordered, func() {
 				Namespace: utils.OLSNamespaceDefault,
 			}, sm)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "ServiceMonitor should be deleted")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: utils.OLSCAConfigMap, Namespace: utils.OLSNamespaceDefault}, &corev1.ConfigMap{})).To(Succeed(), "baseline service CA must remain")
 		})
 	})
 })

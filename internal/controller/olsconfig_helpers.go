@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -441,29 +442,21 @@ func (r *OLSConfigReconciler) annotateExternalResources(ctx context.Context,
 	secretMapping := make(map[string][]string)
 	configMapMapping := make(map[string][]string)
 
-	// Annotate all external secrets
+	// Build the union before annotating. MCP CAs reconcile rather than restart
+	// directly; empty mappings suppress the default app-server restart.
+	hotReloadSecrets := make(map[string]bool)
 	err := utils.ForEachExternalSecret(cr, func(name string, source string) error {
-		// TLS secrets affect both console (CA cert) and backend (server cert)
-		if source == "tls" {
-			secretMapping[name] = []string{
-				utils.ConsoleUIDeploymentName,
-				utils.OLSAppServerDeploymentName,
-			}
-		}
-
-		// When credentialHotReload is enabled, LLM secrets are not watched —
-		// the service re-reads credentials from disk (RFE-9380).
 		if credentialHotReload && strings.HasPrefix(source, "llm-provider-") {
-			if err := r.removeSecretAnnotationIfNeeded(ctx, name, r.Options.Namespace); err != nil {
-				r.Logger.Error(err, "Failed to remove annotation from secret", "secret", name)
-				errs = append(errs, err)
-			}
+			hotReloadSecrets[name] = true
 			return nil
 		}
-
-		if err := r.annotateSecretIfNeeded(ctx, name, r.Options.Namespace); err != nil {
-			r.Logger.Error(err, "Failed to annotate secret", "source", source, "secret", name)
-			errs = append(errs, err)
+		if _, exists := secretMapping[name]; !exists {
+			secretMapping[name] = []string{}
+		}
+		if source == "tls" {
+			addExternalResourceTargets(secretMapping, name, utils.ConsoleUIDeploymentName, utils.OLSAppServerDeploymentName)
+		} else if source != "mcp-ca" {
+			addExternalResourceTargets(secretMapping, name, utils.OLSAppServerDeploymentName)
 		}
 		return nil
 	})
@@ -471,23 +464,42 @@ func (r *OLSConfigReconciler) annotateExternalResources(ctx context.Context,
 		errs = append(errs, err)
 	}
 
-	// Annotate all external configmaps
-	err = utils.ForEachExternalConfigMap(cr, func(name string, source string) error {
-		// Alerts adapter runtime config restarts only the adapter deployment.
-		// annotateConfigMapIfNeeded no-ops when the CM is absent; the ConfigMap Create
-		// watcher handles annotation and restart on first creation.
-		if source == "alerts-adapter" {
-			configMapMapping[name] = []string{utils.AlertsAdapterDeploymentName}
+	for name := range hotReloadSecrets {
+		if _, watched := secretMapping[name]; !watched {
+			if err := r.removeSecretAnnotationIfNeeded(ctx, name, r.Options.Namespace); err != nil {
+				r.Logger.Error(err, "Failed to remove annotation from secret", "secret", name)
+				errs = append(errs, err)
+			}
 		}
-
-		if err := r.annotateConfigMapIfNeeded(ctx, name, r.Options.Namespace); err != nil {
-			r.Logger.Error(err, "Failed to annotate configmap", "source", source, "configmap", name)
+	}
+	for name := range secretMapping {
+		if err := r.annotateSecretIfNeeded(ctx, name, r.Options.Namespace); err != nil {
+			r.Logger.Error(err, "Failed to annotate secret", "secret", name)
 			errs = append(errs, err)
 		}
-		return nil // Continue iteration even on error
+	}
+
+	// ConfigMaps can serve several consumers, including MCP and the adapter.
+	err = utils.ForEachExternalConfigMap(cr, func(name string, source string) error {
+		if _, exists := configMapMapping[name]; !exists {
+			configMapMapping[name] = []string{}
+		}
+		if source == "alerts-adapter" {
+			addExternalResourceTargets(configMapMapping, name, utils.AlertsAdapterDeploymentName)
+		} else if source != "mcp-ca" {
+			addExternalResourceTargets(configMapMapping, name, utils.OLSAppServerDeploymentName)
+		}
+		return nil
 	})
 	if err != nil {
 		errs = append(errs, err)
+	}
+
+	for name := range configMapMapping {
+		if err := r.annotateConfigMapIfNeeded(ctx, name, r.Options.Namespace); err != nil {
+			r.Logger.Error(err, "Failed to annotate configmap", "configmap", name)
+			errs = append(errs, err)
+		}
 	}
 
 	// Publish complete mappings atomically for watcher event handlers.
@@ -503,6 +515,15 @@ func (r *OLSConfigReconciler) annotateExternalResources(ctx context.Context,
 	r.syncOpenShiftMCPServerTLSWatcher(cr)
 	r.syncRHOKPTLSWatcher(cr)
 	return nil
+}
+
+// addExternalResourceTargets preserves the union when one source serves several consumers.
+func addExternalResourceTargets(mapping map[string][]string, name string, targets ...string) {
+	for _, target := range targets {
+		if !slices.Contains(mapping[name], target) {
+			mapping[name] = append(mapping[name], target)
+		}
+	}
 }
 
 // syncOpenShiftMCPServerTLSWatcher enables watching openshift-mcp-server-tls only while
@@ -605,11 +626,16 @@ func (r *OLSConfigReconciler) annotateConfigMapIfNeeded(ctx context.Context, nam
 // Returns true if:
 // 1. The secret has the watcher annotation (annotated by operator for change tracking)
 // 2. The secret is configured as a system resource (external resource like pull-secret)
+// 3. It is an enabled local MCP CA reference, even without an annotation.
+// Disabled MCP-only references ignore stale annotations.
 func (r *OLSConfigReconciler) shouldWatchSecret(obj client.Object) bool {
-	// Check 1: Has watcher annotation?
-	annotations := obj.GetAnnotations()
-	if annotations != nil {
-		if _, exists := annotations[utils.WatcherAnnotationKey]; exists {
+	if referenced, watch := r.mcpCAWatchState(obj, true); referenced {
+		if watch {
+			return true
+		}
+		// Ignore disabled MCP-only sources, even with stale annotations.
+	} else if obj.GetNamespace() == r.Options.Namespace {
+		if _, exists := obj.GetAnnotations()[utils.WatcherAnnotationKey]; exists {
 			return true
 		}
 	}
@@ -633,11 +659,15 @@ func (r *OLSConfigReconciler) shouldWatchSecret(obj client.Object) bool {
 // Returns true if:
 // 1. The configmap has the watcher annotation (annotated by operator for change tracking)
 // 2. The configmap is configured as a system resource (external resource like CA bundle)
+// 3. It is an enabled local MCP CA reference, even without an annotation.
+// Disabled MCP-only references ignore stale annotations.
 func (r *OLSConfigReconciler) shouldWatchConfigMap(obj client.Object) bool {
-	// Check 1: Has watcher annotation?
-	annotations := obj.GetAnnotations()
-	if annotations != nil {
-		if _, exists := annotations[utils.WatcherAnnotationKey]; exists {
+	if referenced, watch := r.mcpCAWatchState(obj, false); referenced {
+		if watch {
+			return true
+		}
+	} else if obj.GetNamespace() == r.Options.Namespace {
+		if _, exists := obj.GetAnnotations()[utils.WatcherAnnotationKey]; exists {
 			return true
 		}
 	}
@@ -653,6 +683,44 @@ func (r *OLSConfigReconciler) shouldWatchConfigMap(obj client.Object) bool {
 	}
 
 	return false
+}
+
+// mcpCAWatchState also finds unannotated references when validation has
+// prevented publishing watcher mappings. User refs are namespace-local.
+func (r *OLSConfigReconciler) mcpCAWatchState(obj client.Object, secret bool) (referenced, watch bool) {
+	if obj.GetNamespace() != r.Options.Namespace {
+		return false, false
+	}
+	cr := &olsv1alpha1.OLSConfig{}
+	if err := r.Get(context.Background(), client.ObjectKey{Name: utils.OLSConfigName}, cr); err != nil {
+		return false, false
+	}
+	for _, ref := range cr.Spec.OLSConfig.MCPKubeServerConfig.CAReferences() {
+		if secret && ref.Secret != nil && ref.Secret.Name == obj.GetName() ||
+			!secret && ref.ConfigMap != nil && ref.ConfigMap.Name == obj.GetName() {
+			referenced = true
+			break
+		}
+	}
+	if !referenced {
+		return false, false
+	}
+	if utils.BoolDeref(cr.Spec.OLSConfig.IntrospectionEnabled, true) {
+		return true, true
+	}
+	// Preserve non-MCP consumers when introspection is disabled.
+	enumerate := utils.ForEachExternalConfigMap
+	if secret {
+		enumerate = utils.ForEachExternalSecret
+	}
+	_ = enumerate(cr, func(name, source string) error {
+		if name == obj.GetName() && !(secret && strings.HasPrefix(source, "llm-provider-") &&
+			utils.BoolDeref(cr.Spec.OLSConfig.CredentialHotReload, false)) {
+			watch = true
+		}
+		return nil
+	})
+	return referenced, watch
 }
 
 // isRESTMappingError returns true when the error is caused by the API server's

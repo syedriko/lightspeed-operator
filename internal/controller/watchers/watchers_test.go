@@ -479,6 +479,7 @@ var _ = Describe("Watchers", func() {
 	Describe("restartDeployment with in-cluster restart", func() {
 		It("restarts app server deployment", func() {
 			cr := utils.GetDefaultOLSConfigCR()
+			cr.Spec.LLMConfig.Providers[0].CredentialsSecretRef.Name = "annot"
 			dep := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      utils.OLSAppServerDeploymentName,
